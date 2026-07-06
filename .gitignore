@@ -1,0 +1,12 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Python caches (in case any tooling runs here)
+__pycache__/
+*.py[cod]
+.pytest_cache/
