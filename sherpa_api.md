@@ -48,6 +48,11 @@
 | POST | /build/flight-search | Async: search Duffel flights, stream FlightOfferBlock via AppSync |
 | POST | /build/flight-seats | Async: create ARGO cart item from offer_id, fetch seat map + extras, publish `seat_map` AppSync block |
 | POST | /trip/init | Sync: save trip slots (destination, dates, budget, origin_iata, products_needed) + run budget allocation; returns {trip_id, budget_allocation, slots} |
+| POST | /trips | Save-for-Later upsert (JWT). Body = ARGO Cart/Order pre-image (§0.5): `{trip_id, status ∈ saved\|demo_paid, cart, order?, plan_context?, last_check?, plan_version}`. PK forced to caller sub (body `user_id` ignored). Server invariants: `order.mock≠false`, `order_id` in `DEMO-` namespace, per-line `source=="demo_mock" ⇒ provider_order_id null`, no client `provider` line, ≤100KB. `saved_at` set once, `updated_at` always. Returns `{trip_id, status, plan_version, updated_at}` |
+| GET | /trips | List the caller's saved trips (JWT). Single `Query` on caller sub, `Limit=100`. Returns summary rows (`{trip_id, status, plan_version, currency, cart_total_minor, destination, date_range, has_order, saved_at, updated_at}`) — NOT the full cart/plan blobs |
+| GET | /trips/{id} | Return one full stored trip (JWT). `GetItem` keyed on caller sub → foreign id misses → 404. Returns `{trip}` (Decimal money → int/float) |
+| DELETE | /trips/{id} | Delete one saved trip (JWT). Keyed on caller sub. Idempotent (missing row → 200 `{deleted}`) |
+| POST | /build/hotel-recheck | Re-price saved hotels before the (mock) pay step (JWT; stateless, no user data). Body `{hotelIds[≤20, 32-char], checkIn, checkOut, city?}`. Returns `{results: {hotelId: {available, total_price, nightly, currency}}}`; degrades to `{results: {}}` on a LENS miss. LENS is a public Function URL (`LENS_HUB_STREAM_URL`, no IAM/VPC) via vendored `shared/lens_recheck.py` |
 
 **`/build/flight-seats` request shape:**
 ```json
@@ -94,6 +99,7 @@ def _admin_auth(event):
 | Test file | What it covers |
 |-----------|---------------|
 | `tests/cognitive/test_api_handler.py` | Route matching, admin auth, 202 response shape |
+| `tests/cognitive/test_saved_trips.py` | Save-for-Later: claims.sub isolation, allow_link=False write surface, order realness invariants, save→get round-trip (money float↔Decimal), hotel-recheck degrade paths |
 
 ## Gotchas
 - Route matching is string-based (`path.startswith(...)`) — order matters. More specific routes must come before catch-alls
@@ -101,3 +107,6 @@ def _admin_auth(event):
 - DNA Config API URL is `https://h9we9bv5r4.execute-api.eu-west-3.amazonaws.com` — set via `DNA_CONFIG_API_URL` env var
 - `/turns` passes `discover_only` (bool) through to the cognitive event when present in the body — mirrors the `trip_shape`/`budget_abs` passthrough; routes the turn to the product-free destination picker (gated `if discover_only or not city`)
 - `/images` IAM is already covered by the api role's `parameter/${Project}/${Env}/*` SSM wildcard (key at `/mywai-sherpa/prod/unsplash/access_key`); SecureString on AWS-managed `alias/aws/ssm` decrypts with `WithDecryption=true` alone (no `kms:Decrypt`)
+- Saved-trips is a WRITE surface: `_resolve_effective_user_id(..., allow_link=False)` — a linked companion (account-link) can NOT write to another user's shelf; only the caller's own sub or a real `sherpa-dev` login. Contrast the facts panel which uses the `allow_link=True` default
+- Exact-suffix `path.endswith("/trips")` (list/upsert) MUST be dispatched before the `"/trips/" in path` (by-id) branches, else the by-id handlers shadow the list. `/trips` is NOT shadowed by `/trip/init` (different suffix/substring)
+- `/build/hotel-recheck` needs `LENS_HUB_STREAM_URL` on the API Lambda (box7) — it is NOT there by default (only box4-cognitive had it). Deploy passes `LensHubStreamUrl` in `deploy_box7`. Unset → recheck silently returns `{}`. The LENS client is vendored as `lambda/shared/lens_recheck.py` (box7 packages `shared/`); it is NOT a drift-gated mirror. Deploy order: box1 (table) → box7 (IAM + routes + env + code)
