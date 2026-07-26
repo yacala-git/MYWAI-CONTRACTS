@@ -49,7 +49,7 @@
 
 **FlightSliceSummary fields:** `origin`, `destination`, `origin_airport_name`, `destination_airport_name`, `departing_at` (ISO datetime), `arriving_at` (ISO datetime), `duration_min`, `stops`, `via` (list of IATA connection codes).
 
-### HotelBlock (49 fields, key subset)
+### HotelBlock (52 fields, key subset)
 | Field | Type | Purpose |
 |-------|------|---------|
 | `hotel_id` | str | Provider hotel ID |
@@ -57,11 +57,26 @@
 | `match_score` | int 0-100 | Calibrated DNA match for display |
 | `status` | BlockStatus | LOCKED/SOFT/PLACEHOLDER |
 | `km_from_anchor` | float? | PostGIS distance from queried landmark |
+| `photo_urls` | list[str] | Gallery, ≤10 CDN urls (B5(a), raised from 4) |
 | `amenities` | list[str] | Canonical amenity codes (am_*) |
-| `amenity_labels` | list[str] | Human-readable pill labels |
+| `amenity_labels` | list[str] | Human-readable pill labels — **REQUESTED subset only** (playground match pills; do NOT widen) |
+| `amenity_labels_all` | list[str] | B5(b) EVERY amenity as a label, deduped + case-insensitively sorted, ≤50 |
+| `usps` | list[str] | B5(c) ≤3 selling bullets (Aurora `usps`, else DDB `metadata.usps`), each ≤240 chars |
+| `description` | str? | B5(d) property blurb — `dna_full.stay`, else `.vibe`, else None; ≤400 chars, word-boundary trim + `…` |
 | `dna_full` | dict | vibe/stay/food/wellness/persona/archetype from Aurora |
 | `codon_contribs` | list | Per-codon score trace |
 | `why` | str | DNA-match rationale sentence |
+
+**B5 richer hotel block (2026-07-25)** — the four fields above are ADDITIVE with safe
+defaults (`[]`/`[]`/`None`); consumers that ignore them are byte-unaffected. All populated
+at compose time from data already in scope (the Aurora hit + the DDB canonical record) —
+**no extra reads, no new IAM**. Amenity *labels* resolve from `_AMENITY_CODE_MAP` first,
+then from `config/amenity_frequency/{city}.json` in `CONFIG_BUCKET` (generated from Aurora
+`amenities_registry`), loaded **lazily from inside the compose path** and cached per
+container — never at module import (Aurora auto-stops overnight; an import-time remote read
+would hang cold starts). A registry failure degrades to the hardcoded map and skips unknown
+codes; it never fails the block. Every field is size-bounded because the demo persists the
+hotel sketch verbatim into a DynamoDB row.
 
 ### Stroke (preference signal)
 | Field | Type | Note |
