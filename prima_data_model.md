@@ -55,6 +55,8 @@
 | `hotel_id` | str | Provider hotel ID |
 | `stars` | int 1-5 | Hotel star rating |
 | `match_score` | int 0-100 | Calibrated DNA match for display |
+| `cancellation_deadline` | str? | ISO-8601, THREE states: instant `"…T18:00:00+02:00"` / bare date `"2026-09-01"` / `null`. Never a `date` — see `sherpa_sketch_engine.md` |
+| `free_cancellation` | bool? | TRI-STATE; `None` = not known → renders as silence |
 | `status` | BlockStatus | LOCKED/SOFT/PLACEHOLDER |
 | `km_from_anchor` | float? | PostGIS distance from queried landmark |
 | `photo_urls` | list[str] | Gallery, ≤10 CDN urls (B5(a), raised from 4) |

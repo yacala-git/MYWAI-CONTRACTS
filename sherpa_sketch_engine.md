@@ -117,6 +117,24 @@ The card match % was computed by a 7-anchor piecewise-linear curve that lived ON
 - `SketchFooter.total_all_in: Optional[float] = None` is ADDITIVE.
 - **CLIENT seat/extras reconciliation (2026-07-13, finish-page redesign — design (a)):** user-selected **seat fees** (and future bags/extras) are CLIENT-known only (chosen in the seat stage, held in React state, never POSTed) and are **NOT in `total_all_in`**. The finish surfaces therefore fold them on TOP: the UI's displayed trip total = `total_all_in` + client all-pax seat/extras total (shared `resolveTripTotal({..., seatsExtrasTotal})` in `mywai-hotel-providers/ui/src/components/tripTotal.ts`, surfaced as a "Seats & extras €X" receipt line). The finish bar and the confirmation card read the SAME resolved total so they cannot disagree. **KNOWN FUTURE MIGRATION → design (b) when `mywai-booking` lands:** the server total must then include seats to hand to the cart (the agent never pays, but the cart needs the accurate charge), so the client will POST selected seats/extras and `total_all_in` becomes server-authoritative incl. seats. Until then the server contract above is unchanged.
 
+## Cancellation deadline — an ISO STRING with three wire states (2026-08-11, ticket 40)
+
+`HotelBlock.cancellation_deadline` and its `SketchFooter` mirror are `Optional[str]`, **not** `Optional[date]`. The renderer's terms line branches on whether the supplier gave a TIME, so the wire must say three things apart:
+
+| State | Wire value | Meaning |
+|-------|-----------|---------|
+| instant | `"2026-09-01T18:00:00+02:00"` | Deadline with a time. An offset/`Z` makes it absolute → render it in the DESTINATION's clock. **No** offset = the supplier quoted a naive local time at the property → already the destination's clock, do NOT re-zone. |
+| bare date | `"2026-09-01"` | Day known, time NOT known. A complete, legitimate state — never filled in with a start/end of day. What a bare date MEANS is a separate live-probe question; until then the renderer prints nothing. |
+| no deadline | `null` | The supplier quoted none. Distinct from a bare date. |
+
+**Consumer test:** `null` → none; else `"T" in value` → instant; else → bare date.
+
+- **`shared/sketch_types.py::normalize_supplier_deadline(raw) -> Optional[str]`** is the single normalizer. Value-preserving only: never adds a time to a date, never adds a zone to a naive instant, never derives a deadline from `check_in` (ticket 06 stands). `date`/`datetime` objects → `isoformat()`. Unparseable → `None` + a `cancellation_deadline_unparseable` WARNING (logged, not swallowed). Parsing is explicit rather than leaning on `date.fromisoformat` leniency, which differs across interpreters.
+- **Producers must call it** — `handler._apply_price`, the two AppSync publishes (`hotel_alternative_added`, `hotel_price_update`), the persisted `_wave2_alts` pool, and `sketch_engine.swap_block`'s rebuild. A `field_validator(mode="before")` on both models is the construction/`model_validate` backstop (these models do NOT set `validate_assignment`, so a plain attribute assignment bypasses it). The footer keeps mirroring the composed hotel verbatim.
+- **Wire compat:** a bare date and an absent deadline serialize byte-identically to the old `date` field, so no existing consumer or persisted row changes. Only the previously-destroyed instant is new.
+- **Fixed in passing:** `swap_block` used `model_dump()` (not `mode="json"`) and `_handle_swap_block` returns straight out of the Lambda, whose runtime `json.dumps` has no `default=str` — so the old `date` OBJECT made every /swap response with a bare-date alternative fail to serialize. A string cannot.
+- **Not carried:** `/build/hotel-recheck` still returns availability + price only, no terms — unchanged by this ticket.
+
 ## `SketchFooter.pax_adults` — authoritative (verified 2026-07-06)
 `pax_adults` is fully resolved in `handler.py` (produce_intent → `_extract_trip_params`, then trip-type/family defaults) BEFORE `run_sketch_engine`, threaded through `_compose_one_sketch` → `_build_footer(pax_adults=...)`, and persisted to `trip_slot["pax"]["adults"]` (restored on the committed fast-path). So `footer.pax_adults` always carries the resolved value — the UI can drop its `TRIP_TYPE_PAX` pill re-derivation. No code change (verification task).
 
@@ -126,6 +144,7 @@ The card match % was computed by a 7-anchor piecewise-linear curve that lived ON
 | `tests/cognitive/test_hotel_query_filter.py` | `_codon_chrom`, whitelist, STAY injection contract, match floor |
 | `tests/cognitive/test_triptych_ranks.py` | `_triptych_rank_depths` invariants + deck pick (hero=pool[0], distinct, no dup) + variation_value picker unchanged |
 | `tests/cognitive/test_swap_score_carry.py` | swap alternatives carry persisted match_score/codon_contribs/dna_boost (not 0) |
+| `tests/cognitive/test_cancellation_deadline_instant.py` | the deadline's three wire states (instant / bare date / none), the normalizer, model rehydration of legacy rows, /swap producer + JSON-serializability, ticket-06 non-regression |
 
 ## Landmark proximity resolution (2026-05-25)
 
