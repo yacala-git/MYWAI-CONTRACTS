@@ -251,7 +251,7 @@ the SAME `TEMPORAL_TOOL_PROPERTY` as produce_intent. Mirrors `extract_contrast_c
 
 When `_flight_needed` is True (trip has "flight" in `products_needed`), `_compose_one_sketch()` calls `_resolve_flight()` in parallel with hotel search.
 
-### `_resolve_flight(origin_city, destination_city, check_in, check_out, pax_adults, exclude_ids, user_constraints)`
+### `_resolve_flight(origin_city, destination_city, check_in, check_out, pax_adults, exclude_ids, user_constraints, progress=None)`
 
 **Airport resolution priority (origin):**
 1. `user_constraints["origin_override"]` — chat override ("fly from Heathrow not Luton") → IATA lookup
@@ -266,6 +266,21 @@ Up to 3 origin airports fired in parallel via `ThreadPoolExecutor` — primary +
 **Timing check:** Haiku call after flight + anchors resolved. Inputs: flight arrival datetime, hotel check-in, Day-1 anchors with `time_of_day`, pax composition, domestic vs international. Output: `anchors_to_defer[]` (Day-1 anchors pushed to Day 2), `lattice_confirms[]` (e.g. "Late arrival 22:45 — hotel will need late check-in notice").
 
 **Return value:** `FlightBlock` with `real_pricing=True`, `offer_id` (Duffel), `slices[]`, `alternatives[]` (up to 4 for swap carousel), `origin_airports_tried[]`.
+
+### Flight progress frames + the ONE seq allocator (2026-08-11, ticket 35)
+
+The ~25s fan-out used to emit nothing. It now reports on itself — no extra supplier call, only frames. Design: booking-flow §14, `BOOKING_FLOW_DESIGN_2026-08-07.html:3464-3478`.
+
+- **`cognitive/flight_progress.py`** — `FlightSearchCounter` (THE one counter) + `FlightProgressEmitter` (the ladder). Block type **`flight_progress`**, payload `{type, phase, line, routes_total, routes_checked, fares_in, sources_unreached, elapsed_ms}`. `phase ∈ {fanout, searching, sources, slow, ranking}`. The `line` is composed server-side, verbatim from the doc, so no client can paraphrase it; the raw numbers ride alongside.
+- **Rules:** the first frame names ROUTES only (a fare count has no denominator yet); climbing frames are batched at 1.5s and their numbers only ever climb (high-water clamp, never re-derived); the >30s line is emitted only while a lane is genuinely outstanding; a lane that failed or passed the collection budget is **unreached, not empty** — excluded from `routes_checked`, never counted as "returned no fares".
+- **A ROUTE = one (origin, destination) pair; its LANES = economy + one call per elevated cabin.** A route is `checked` only when every one of its lanes is back and none failed.
+- **`_LANE_COLLECT_BUDGET_S = 21.0`** — one shared deadline for the whole collection (replaced a serial `future.result(timeout=21)` per lane, which could stack). Lanes are observed as they land; their offers are **replayed in submission order**, so the accumulated pool and every stable-sort tie-break downstream are unchanged.
+- **ONE COUNTER (HTML:3474).** `FlightBlock.offers_evaluated` = `counter.fares_in` (the wait line's closing number AND the reason panel's "Evaluated N options"); `FlightBlock.fares_held` = `1 + len(alternatives)` (the tail door's "All N fares"). Both stamped at the single construction site in `_resolve_flight`. Nothing downstream may recount either. Without a counter (direct invoke / swap / tests) `offers_evaluated` falls back to the ranker's own `len(parsed)` exactly as before.
+- **EVERY fetch feeds the counter, or the number is wrong and hidden.** The direct-relax (`:5856`) and alternative-destination (`:5875`) fallbacks rank offers the first fan-out never produced; they call `progress.add_fares(n)` — which adds to `fares_in` WITHOUT touching route accounting, since they re-query routes already reported. They use `progress`, not `_prog`, so the counter is fed even when the route gate emptied `pairs` and no frames were sent. **`fanout_close()` is called after both fallbacks**, so the ranking frame prints the same closed denominator that is stamped on the block. There is deliberately **no `max(counter, ranker)` reconciliation** — two numbers arbitrated at the read site is what HTML:3474 forbids, and it would hide this defect class rather than surface it. Instead a **tripwire** logs `flight_counter_undercount` at ERROR (persists to the error-log table) whenever `fares_in < best.offers_evaluated`; both UIs hide the line at `offers_evaluated <= 1`, so an uncounted path is otherwise invisible.
+- **Zero fares emits no ranking frame** — "Ranking 0 fares against your taste profile" is not honest; the caller falls back to a scripted placeholder. The dead-source frame is still emitted when a lane died.
+- **PRE-EXISTING, not fixed here:** an empty `pairs` (route gate filtered every pair) makes `_n_workers = 0` and `ThreadPoolExecutor(max_workers=0)` raises, so the alt-destination fallback below it is unreachable and a permanent "no scheduled route" surfaces as "Flight search is temporarily unavailable — please try again". Characterised by `test_an_empty_route_gate_raises_before_any_of_this_PRE_EXISTING_DEFECT`; fixing it changes what a route-gated turn returns, which is a product call.
+- **`shared/turn_seq.py` — `TurnSeq` / `SEQ_STREAM_BASE=9`.** Both clients de-duplicate streamed blocks on `(seq, block.type)`, so a flight frame that reused a hotel frame's pair would be **silently dropped** on any turn that runs both lanes (HTML:3478). `handler._do_sketch` creates ONE `TurnSeq` per turn before the engine runs; the flight ladder and the LENS hotel-price tail (formerly a private `_seq_ctr = [9]`) and the trace/done seqs all draw from it. Seq 0-8 stay hand-assigned; the allocator starts above them. Order does not matter — neither client sorts on seq.
+- **Inert on its own.** `flight_progress` is not in the playground's `SHOWABLE_TYPES` and the demo narrows to `sketch_frame`, so shipping it before ticket 14 renders nothing anywhere. Absence of frames degrades to the previous silent wait.
 
 ### Helper functions (sketch_engine.py, ~line 2071+)
 | Function | Purpose |
