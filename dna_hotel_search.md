@@ -23,9 +23,19 @@ Intent has ≥2 codons AND no geo filter?
 ## Amenity search
 - Aurora: `amenities && ARRAY[...]` is OR (any one code matches)
 - Per-group AND (hotel must have ≥1 code from EACH pill group) enforced in shortlist handler after Aurora returns results
-- Progressive relaxation: if filtered results < 5, drop most-common pill group first (WiFi ~89% dropped before Pool ~9%), retry. Logs `codon_amenity_relax_step`
-- **Hard amenities (pets, accessible, parking):** ONE am_* code per pill sent in `required_amenities` (`h.amenities @> ...` in Tier 1 CTE). Must be one code per pill — `@>` requires ALL listed codes simultaneously, so sending all display names for a pill (e.g. all 3 pet variants) would require a hotel to have every variant at once (8 Paris hotels vs 1,090 with any one). Never passed to the relaxation loop — `_caller_required_amenities` is preserved unchanged in every retry call.
+- Progressive relaxation: if filtered results < 5, drop most-common requirement first (WiFi ~89% dropped before Pool ~9%), retry. Logs `codon_amenity_relax_step` (codon path) / `required_amenity_relax_step` (BM25 path)
+- **NEEDS vs WANTS (booking-flow ticket 03, design ruling 2026-08-11) — the classifier is `lambda/shared/amenity_needs.py`, not string literals in the handler.**
+  - **NEEDS (pets, step-free access, parking)** are never relaxed on EITHER retrieval path. They ride `required_amenities` through every retry; if they cannot be met the shortlist returns what the needs alone produced — possibly nothing. Nothing found is an honest ending; the search is never widened behind the traveller's back.
+  - **WANTS (everything else)** are dropped one at a time, most common first.
+  - A code the shortlist INFERRED itself (the codon→amenity expansion) is always a want, even if it happens to be a need code: the traveller never saw it, so it may never be the reason a search dies. Provenance comes from `_pg_search(caller_required_amenities=...)`, the caller's list captured BEFORE expansion.
+- **Hard amenities (pets, accessible, parking):** ONE am_* code per pill sent in `required_amenities` (`h.amenities @> ...` in Tier 1 CTE). Must be one code per pill — `@>` requires ALL listed codes simultaneously, so sending all display names for a pill (e.g. all 3 pet variants) would require a hotel to have every variant at once (8 Paris hotels vs 1,090 with any one).
 - **Soft amenities (all others):** sent in `amenities` + `amenity_groups`. Subject to progressive relaxation.
+
+## Relaxation output shape
+Set on every row of a relaxed search (was a bare `relaxed_amenity_filter: bool` read nowhere):
+- `failed_requirements: list[str]` — the named requirements THIS hotel fails ('pool', 'breakfast', …). Empty when the hotel has the dropped amenity anyway: it is a full match and belongs above the near-miss divider. Plumbed dna-shortlist → dna-api (verbatim body) → `sketch_engine._dna_shortlist_candidates` → `HotelBlock.failed_requirements`.
+- `relaxed_requirements: list[str]` — everything dropped on this search, same on every row; also lifted to the response body. Not consumed yet.
+- `relaxed_amenity_filter: bool` — kept for backward compatibility.
 
 ## Key files
 | File | Function | Purpose |

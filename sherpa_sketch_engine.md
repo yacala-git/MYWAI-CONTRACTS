@@ -33,9 +33,13 @@
 ## Critical code
 ```python
 # sketch_engine.py — hard vs soft amenity routing in _compose_hotel_filters
-# _HARD_PILL_NAMES = frozenset({"pets", "accessible", "parking"})
-# Hard amenities → required_amenities (Tier 1 CTE, never relaxed)
-# Soft amenities → amenities + amenity_groups (progressive relaxation)
+# _HARD_PILL_NAMES = frozenset({"pets", "accessible", "parking"})  == the design's NEEDS
+# Hard amenities → required_amenities (Tier 1 CTE, never relaxed — enforced on BOTH
+#   dna-shortlist retrieval paths since booking-flow ticket 03; classifier is
+#   mywai-dna/lambda/shared/amenity_needs.py, which mirrors _PILL_GROUPS)
+# Soft amenities → amenities + amenity_groups (progressive relaxation, one at a time)
+# A relaxed search comes back with HotelBlock.failed_requirements naming, per hotel,
+#   which requirements THAT hotel fails. Empty = full match. Ticket 26 renders it.
 if explicit_amenities:
     hard_codes, soft_dns = [], []
     for dn in explicit_amenities:
