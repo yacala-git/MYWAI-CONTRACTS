@@ -205,6 +205,46 @@ fingerprint's input — so what is hashed is what is written.
   **there is no CloudTrail trail in this account.**
 - Netstorming's media taxonomy beyond "no subject signal".
 
+### A re-label must NOT go through box6
+Box6 is the only route the shredder has to Aurora's copy of a gallery — but it does far more than
+write it: it re-embeds every image (~15.6 embedder calls per hotel, measured) and **re-derives the
+hotel's codons from text+image vectors**. A re-label changes a caption; the hotel's text has not
+moved, so its codons cannot have moved. Recomputing them is both wasted money and a chance to change
+something that must stay constant.
+
+Write Aurora directly instead — `UPDATE hotels SET images_s3 = :images_s3::text[] WHERE provider_id
+= :provider_id`, one column. Verified on 3,804 hotels: codon fingerprint byte-identical, box6 never
+invoked. **Reserve box6 for when the PIXELS genuinely change** — new photos really do need embedding.
+
+Two traps in that write:
+- **The match key is `provider_id`** (it holds the master_hotel_id). There is NO `hotel_id` column on
+  `hotels`; a check that used one sat unnoticed for weeks because it was only ever written to a file
+  for an operator to run, never executed.
+- **`_pg_array` escapes `"` and nothing else, not backslashes.** It is a deliberate byte-mirror of
+  `pg_client._pg_array`, so it must stay that way — but a caption or key containing a quote or
+  non-ASCII character would produce a malformed literal. Safe today (captions are `TAG - ROLE` in
+  ASCII, keys are hex paths; verified 0 backslashes and 0 quotes across 45,031 rows), and worth
+  re-checking before any provider whose captions carry free text.
+
+### Aurora holds TWO JSON key orderings, both valid
+Rows written by the shredder lead `{"key": …`; the 4,694 from the 2026-05 rescore lead `{"caption": …`
+because that cohort was republished from a DynamoDB read, and DynamoDB returns map keys
+alphabetically. Both parse identically as JSON. **Do not "normalise" this with a string comparison** —
+compare parsed values, or a check will report thousands of false positives (one did).
+
+### ⚠️ The corpus lives on a db.t3.micro, deliberately
+`dev-post-local-news-new` is a **db.t3.micro with a 0.12 GB InnoDB buffer pool**, SHARED with another
+product. This is a conscious cost decision, not an oversight — so **jobs must adapt to it**.
+
+The InnoDB lock table lives in that buffer pool, so a sustained write run exhausts it and dies with
+`(1206, 'The total number of locks exceeds the lock table size')` — this killed a 45,031-row re-label
+at 46%. It is NOT a query defect: the UPDATE is index-perfect (PK `(master_hotel_id, media_id)`,
+EXPLAIN `key=PRIMARY rows=1`) and transactions are already one small commit per hotel.
+
+Any corpus-scale write here needs: bounded retry on **1205 / 1206 / 1213** with backoff, a pause
+between units, and resumability — a job that must restart from zero on a transient failure is not
+safe on this instance.
+
 ## Reaching the data
 ⚠️ The `mysql` CLI **fails against this cluster** since the MySQL 8.4 upgrade (5 Aug) with
 `ERROR 2026 (HY000): SSL connection error: unknown error number`. Use `python3` + `pymysql`. Bash also
