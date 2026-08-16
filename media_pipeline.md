@@ -103,7 +103,15 @@ category. **SHERPA reads the key and discards the caption** (`sketch_engine.py:1
   linen at room scope). **Any provider's facility id is meaningless without its scope.**
 
 ### ⚠️ `content_hash` — the dirty-marker, and both its failure modes
-`content_hash IS NULL` means **"needs re-shredding"**. It is a designed signal, not corruption.
+> **✅ SPLIT 15 Aug 2026 (commit `4ad4090`).** `needs_reshred = 1` is now the ONLY work marker;
+> `content_hash` is purely a content fingerprint that writers never blank. The column
+> `canonical_hotels.needs_reshred BOOLEAN NOT NULL DEFAULT 0` is live. **Never `OR` the two signals
+> together in a query** — they mean different things and reading both sweeps the same hotels twice.
+> Everything below is retained because it explains WHY, and because the activity clone
+> (`activity_watchdog/watchdog.py:64` and friends) still uses the old conflated convention and
+> inherits this landmine when activities go live.
+
+`content_hash IS NULL` used to mean **"needs re-shredding"**. It was a designed signal, not corruption.
 
 - **It is blanked wholesale by the factory.** `glue_etl_script.py:1478-1484` blanks its entire delta
   batch unconditionally on every run, even when zero media rows are inserted. On 14 May 2026 that
@@ -120,18 +128,51 @@ category. **SHERPA reads the key and discards the caption** (`sketch_engine.py:1
   DNA — permanently, and invisible to any NULL-count telemetry.
 
 ### The fingerprint mixes text and images
-An image-only change re-runs the Haiku DNA pass, because the fingerprint includes the first five
-gallery URLs. **Photo work costs Bedrock money it should not.** Splitting it into a text-hash and an
-image-hash is the single highest-leverage change in this pipeline.
+> **✅ SPLIT 15 Aug 2026.** Two version-tagged halves in the same 32-char column (`t…`/`i…`), read by
+> `split_content_hash`. Text half changed → full shred. Image half only → `refresh_gallery_only`,
+> which republishes **both** projections and never calls Bedrock. The image half includes the
+> **classifier identity**, so improving the model makes affected hotels detectably stale instead of
+> needing a hand-driven pass.
+
+An image-only change used to re-run the Haiku DNA pass, because the fingerprint included the first
+five gallery URLs. **Photo work cost Bedrock money it should not.**
+
+⚠️ **THE HALVES ARE UNREADABLE ON EVERY PRE-SPLIT ROW.** All 5,639 stored hashes are bare v1 MD5s, so
+`split_content_hash` returns `(None, None)` and both halves read as UNKNOWN — which is deliberately
+treated as *changed*. **The cheap gallery-only path is therefore unreachable for the current corpus**:
+every hotel falls through to a full shred until it has been shredded once under the new scheme. A
+deliberate re-label job must call `refresh_gallery_only` DIRECTLY rather than inferring its way in
+through the hash comparison — and when it does, it must write **neither** `needs_reshred` **nor**
+`content_hash` (pass the stored hash through unchanged), or a hotel flagged for a genuine text change
+is silently unflagged and that change is lost. Note `update_content_hashes` clears the flag in the
+same UPDATE, so calling it at all breaks this.
+
+### ⚠️ `canonical_hotel_media.updated_at` is the aggregator's change signal
+The column is `on update CURRENT_TIMESTAMP`, and `media_aggregator.py` dirty-marks every hotel whose
+media row moved inside a 10-minute window. **Any bulk UPDATE of that table therefore looks like a
+corpus-wide media change** and queues a full-price re-shred of ~5,639 hotels — enough to trip the
+$0.50/day cap and deny Bedrock platform-wide for weeks.
+
+Any job that writes to `canonical_hotel_media` for reasons that are **not** a media change must
+preserve it explicitly: `SET …, updated_at = updated_at`. `scripts/import_provider_image_labels.py`
+does this on every write and is the reference implementation.
+
+### Aurora is the copy that is served, and it was truncated to 10
+SHERPA reads `aurora.images_s3 or hive.images_s3` — **Aurora first**, DynamoDB only as a fallback.
+Until 15 Aug the full shred wrote `gallery[:10]` to the published record while DynamoDB received the
+whole gallery, so the served copy was capped at 10 photos even though **3,430 of 5,641 hotels carry
+more**. Both now go through the single uncapped `build_image_projection`, which is also the image
+fingerprint's input — so what is hashed is what is written.
 
 ## 4. Measured state (15 Aug 2026)
 
 | | |
 |---|---|
 | `canonical_hotel_media` | 134,730 rows · 4,715 hotels · avg 28.6, max 95 |
-| category NULL | 32,422 (24%) |
+| category NULL | 32,422 (24%) → **0 for hotelbeds** after `cb028b5` |
 | `is_hero` set | **0** |
 | provider split | hotelbeds 89,699 · netstorming 45,031 |
+| `subject_source` | provider 89,699 · none 45,031 (netstorming, awaiting the classifier) |
 | Paris / Rome | 107,938 imgs (38.2/hotel) · 26,792 (9.5/hotel) |
 | Rome from hotelbeds | **0** — 97,993 ingested, never merged; the job has not run since 30 Apr |
 | hotels with a blank marker | 3,703 of 5,639 — **99.4% already have DNA** |
@@ -145,7 +186,17 @@ image-hash is the single highest-leverage change in this pipeline.
    boardrooms.
 5. **Check which artifact you are changing** — fixing `images_s3` without fixing the merge re-derives
    the same set.
-6. **Assume any factory or aggregator run will mass-dirty the corpus** until the marker split lands.
+6. **Assume any factory or aggregator run will mass-dirty the corpus.** The marker split (`4ad4090`)
+   makes the signal honest, not harmless — the writers are change-scoped, but a *corpus-wide* media
+   refresh still flags everything.
+7. **Preserve `updated_at`** on any write to `canonical_hotel_media` that is not a real media change.
+8. **The provider's label is revisable, the model's is not.** `subject_raw` stores the supplier's own
+   code verbatim, so changing our minds about a mapping is a re-map — no re-fetch, no re-classify.
+   Per-provider mappings live in `providers.media_config` (a column the Analyst does not regenerate),
+   never in code.
+9. **A cheap path is only cheap if it is reachable.** Check what the current corpus actually stores
+   before assuming a skip/fast path applies to it — every stored hash predating a scheme change reads
+   as "unknown", and unknown routes to the expensive branch by design.
 
 ## 6. Not established
 - Whether the 50-cap and the 30-classify limit were ever tuned (no comment, commit or doc explains
@@ -154,7 +205,20 @@ image-hash is the single highest-leverage change in this pipeline.
   **there is no CloudTrail trail in this account.**
 - Netstorming's media taxonomy beyond "no subject signal".
 
+## Reaching the data
+⚠️ The `mysql` CLI **fails against this cluster** since the MySQL 8.4 upgrade (5 Aug) with
+`ERROR 2026 (HY000): SSL connection error: unknown error number`. Use `python3` + `pymysql`. Bash also
+needs `dangerouslyDisableSandbox: true` — the local sandbox blocks port 3306. Credentials:
+SSM `/mywai/prod/giata/mysql/{username,password}`, host
+`dev-post-local-news-new.cxzkwcclfdvr.eu-west-3.rds.amazonaws.com`.
+
+The Bedrock daily cap is CloudFormation stack **`mywai-prod-b22-bedrock-cost-cap`** containing Lambda
+**`mywai-prod-bedrock-cost-cap`** — two different names for the same thing, and querying the stack
+name as if it were a resource returns nothing. It is not an EventBridge Scheduler schedule.
+
 ## Related
+- `4ad4090` marker/fingerprint split · `cb028b5` provider image labels
+- `.scratch/booking-flow/IMAGE_BUILD_PLAN_2026-08-15.md` — the nine-step build plan
 - `.scratch/booking-flow/IMAGE_PIPELINE_GROUND_TRUTH_2026-08-15.md` — the measurements
 - `.scratch/booking-flow/IMAGE_PIPELINE_STUDY_2026-08-15.md` — the study, independently validated
 - `.scratch/booking-flow/CONTENT_HASH_BLANKING_STUDY_2026-08-15.md` — the marker mechanism
