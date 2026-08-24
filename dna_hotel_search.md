@@ -95,6 +95,53 @@ order    = coverage + β·log1p(pop)/log1p(POP_MAX) + γ·log1p(lc)/log1p(LC_MAX
 - `codon_score` returned = the raw coverage (SHERPA match% math sees the genuine signal).
 - Geo path: 2-tier CTE prefilters by `ST_DWithin` ∧ array-overlap before the coverage rank.
 
+## Destination archetype gates fire on STATED intent (2026-08-24)
+
+`destination_codon_search` derives boolean archetype gates that add bounded merit-column
+boosts to the ORDER BY (mountain/alpine, ski, beach, family, business). It now takes an
+optional `gate_codons` param:
+
+```
+gate_src   = gate_codons if gate_codons is not None else codons
+mtn_query  = _is_mtn_query(gate_src)
+ski_query  = _is_ski_query(gate_src)
+beach_query= _is_beach_query(gate_src)
+fam_query  = _is_fam_query(gate_src) or _is_family_mood(mood_filter)
+biz_query  = _is_biz_query(codons)          # UNCHANGED — reads the merged set
+```
+
+- **Why.** `_coverage_query_arrays` strips weights, so a 1x ambient DNA hint and a 5x
+  stated intent are identical to a boolean. Measured live: a FAMILY "make memories" trip
+  returned Tahoe/Park City/Davos/Zermatt because the traveller's DNA mentions mountains.
+  Four of the six mountain-gate codons (`ACTV#SKII/HIKG/MTNG/CLMB`) are not in
+  `_VALID_SESSION_CODONS` at all, so they can ONLY arrive from stored taste.
+- **Caller** (`dna-shortlist/handler.py`, destinations branch) passes
+  `gate_codons=list(intent_codons or [])` ALWAYS. `[]` means "nothing stated" and closes the
+  four gates; `None` (any other caller) preserves legacy merged behaviour.
+- **`gate_codons` ≡ the 5x tier exactly.** `intent_codons` is verified pure — built only
+  from this-turn LLM extraction, a static `pre_context.mood` seed table, or same-session
+  carry-forward of either. No `taste_field`/DNA path reaches it.
+- **Business is the deliberate exception.** Its carrier `DEST#URBN` is injected at DNA-hint
+  tier on purpose (TC-08) and `business_intent` can be True with NO `PURP#WORK` present
+  (Sonnet sets it from a connectivity phrase). Gating it on stated intent would switch
+  business off for exactly those turns. Open follow-up: forward `business_intent` through
+  `mood_filter` so it can be gated on provenance too.
+- **Coverage is byte-identical.** `gate_src` feeds ONLY the four booleans; `codons` /
+  `weights` / `mass` come from the untouched `_coverage_query_arrays`. Pinned by
+  `test_gate_codons_does_not_change_the_coverage_arrays`.
+- **Owned consequence.** box10 runs the mood-bifurcation experiment (arm_b), so `MOOD#ADV`
+  expands via the affinity graph into `ACTV#CLMB`/`ACTV#MTNG`/`DEST#MTNS`. A stated
+  *adventure* turn therefore used to open the mountain gate — and its coastal DEMOTE —
+  through that expansion. It no longer does. `MOOD#ADV` still fires the adventure mood gate
+  on both the SQL and Python legs.
+- **`SOC#GRUP` removed from the family path**, both doors: `_DEST_FAM_QUERY_CODONS` here and
+  `_MOOD_CODON_TO_FILTER_KEY` in SHERPA `sketch_engine.py`. Party composition does not pick
+  a city. Measured: +0.023 correlation with `family_score` across 905 cities. `SOC#GRUP` is
+  still extracted and still reaches the HOTEL path unchanged.
+- **Trap.** These gates are now load-bearing on the fold at `sketch_engine.py:5739` that
+  merges `session_intent_codons` into `intent_codons`. `dna-api`'s destinations branch never
+  reads `session_intent_codons`. Remove that fold and every gate goes silent, with no error.
+
 ## STAY.TIER → BUDG codon derivation (2026-05-23)
 
 Every hotel now receives BUDG codons derived deterministically from its STAY.TIER in `stay_v2_codons_from_vectors()` (`pg_client.py`). This ensures the BUDG chromosome has full corpus coverage so intent Jaccard scoring works for budget queries.
