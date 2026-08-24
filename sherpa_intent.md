@@ -20,17 +20,15 @@ Session intent codons are extracted by Sonnet alongside other IntentPayload fiel
 
 **Key rule**: amenity requests are NOT session intent. `"needs wifi"` → `[]`. `"with babysitting"` → `[]`. `"has a spa"` → `[]`. Only explicit trip-purpose or social-context statements emit codons.
 
-## Enrichment redesign — the provenance wall (2026-06-28, LIVE)
+## Enrichment redesign — the provenance wall (collapsed to single live path, 2026-07-06)
 Fixes the 87→30 match-score collapse. **Root cause**: dna-api `_handle_engine_shortlist` re-derived its own intent codons from the seasonality-decorated FAISS query **text** (`_search_codons_for_signal`) and scored them at full 5× — the seasonal prose ("Bastille Day, Paris Plages, free alternatives") sat semantically near budget, fabricating `BUDG#ECON/BARG` against a luxury DNA → cosine collapse. Deterministic, date-driven (July fabricated, September clean).
 
-Flag-gated via `lambda/shared/enrich_flags.py` (SSM prefix `/mywai-sherpa/prod/enrich/`, 60s TTL, fail-open). All flags promoted LIVE:
-| Flag | State | Effect |
-|------|-------|--------|
-| `forward_intent_codons` | **on** | SHERPA forwards its **genuine** full-weight `intent_codons` to the shortlist; dna-api consumes them and **STOPS** re-extracting from query text (the "wall"). Un-inverts the old weighting (genuine were 0.5×, text-fabricated 5×). Mirrored by DNA flag `/mywai-dna/prod/dna/intent/source=forwarded`. |
-| `translate_only` | **on** | Haiku enrichment is **translate-only** (temp 0) — preserves the user's verbatim intent, no reworded prompt. (Contrast handling must move to Sonnet before this is permanent.) |
-| `city_base` | **off** | Removed the static Paris/Rome "near landmarks / historic centre" templates — no canned geo prose injected. |
-| `seasonal_prose` | **off** | Seasonality/lattice/weather prose is **no longer appended** to the codon-extraction input — it now lives **only** in the ADVISORY channel (chat copy + `turn_diagnostic`), never inferring user intent. |
-| `geo_access_nudge` | off | Increment E placeholder (hotel-location → available-activities nudge); not built. |
+Originally shipped flag-gated (`lambda/shared/enrich_flags.py`, SSM prefix `/mywai-sherpa/prod/enrich/`). **The flag family has been retired (module deleted) and the dual paths collapsed to the single LIVE prod path** — there is now exactly one enrichment path, no runtime flag surface:
+- **forward_intent_codons (was on) — now unconditional.** SHERPA always forwards its **genuine** full-weight `intent_codons` to the shortlist; dna-api consumes them and **STOPS** re-extracting from query text (the "wall"). The genuine/dna-implied split (`_split_intent_codons`) always runs. Mirrored by DNA flag `/mywai-dna/prod/dna/intent/source=forwarded`.
+- **translate_only (was on) — now unconditional.** On the hotel path (`produce_intent=False`) Haiku enrichment is **translate-only** — preserves the user's verbatim intent, no reworded prompt.
+- **city_base (was off) — path removed.** The static Paris/Rome "near landmarks / historic centre" templates (`_CITY_BASE`) are deleted; every city uses the neutral `hotel in {city}` base.
+- **seasonal_prose (was off) — path removed.** Seasonality/lattice/weather prose is never appended to the codon-extraction input — it lives **only** in the ADVISORY channel (chat copy + `turn_diagnostic`), never inferring user intent. Numeric `demand_surge`/`price_pressure` signals still flow via `seasonality_context` unchanged.
+- **geo_access_nudge (was off) — dead plumbing removed.** Increment E placeholder was never built; no call site existed.
 
 **Provenance, not codon-type**: a budget codon is fine when the user genuinely asked ("cheap hotel" → still rebases to 3–4★ via `intent_rebase`). The defect was budget codons **fabricated from prose the user never said**. The wall preserves genuine intent and eliminates only fabricated intent. Guarded by `tests/baselines/test_enrichment_invariants*.py` (INV-2 provenance, offline + integration tiers) and the DNA `TestScoreCalibrationProvenance` regression.
 
@@ -164,6 +162,18 @@ output as trustworthy as the old deterministic path. All arithmetic lives in `te
 obtains the IR from `extract_temporal_ir` (handler.py) — ONE cue-gated (`_TEMPORAL_CUE_RE`),
 per-turn-memoized Haiku call forcing a `report_temporal` tool with the SAME schema. `kind != none`
 overrides the persisted dates; `kind == none` freezes them (year-normalised in the resolver).
+
+**Provenance — a resolved window is not automatically a chosen one (2026-08-14, ticket 78):**
+`dates_user_committed` says the TRAVELLER chose these days, and it is decided by the IR's KIND,
+never by confidence. `temporal_resolver.CHOSEN_DAY_KINDS` is the positive list (explicit,
+tomorrow, this/next weekend, long weekend, this/next weekday, next week, week after next,
+in_n_days, in_n_weeks, nth_weekend); `day_is_guessed(ir)` is True for everything else — the bands
+(`in_month`/`month_part`/`season`/`next_month`), `weekend_in_month`, `none`, and any kind added
+later. A guessed window is still USED (the trip has to plan against something) and is recorded as
+`("default", explicit=False)` in both homes. Read by the two doors a phrase comes through:
+`/trip/init` (a `date_phrase`) and `_resolve_trip_window` (the turn path's ONE arbiter) — the
+confidence gate there still only decides whether the phrase was UNDERSTOOD, not who chose it.
+A guess becomes a choice when the traveller states or taps the days (`_set_cell` endorsement).
 
 **Flight delta fast-path (2026-06-19):**
 Once a destination is committed, `_apply_flight_delta` is called on every turn to detect cabin/direct/origin/dest changes without an LLM call. It receives `trip_shape` and `hotel_locked` context:

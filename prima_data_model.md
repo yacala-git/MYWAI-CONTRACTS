@@ -103,7 +103,16 @@ class SketchFrame(BaseModel):
     sketches: list[SketchCard]       # 1, 2, 3, or 7 cards
     variation_axis: str              # axis that varies across sketches
     no_inventory: bool = False       # UI "no rooms found" state
+    no_inventory_reason: str | None  # WHY the zero: no_supply | lookup_failed | not_priced
+                                     #             | no_availability | same_city
+    hotel_lane_failed: bool = False  # the stay LOOKUP broke (not "nothing available")
     alternatives: list[HotelBlock]  # in-budget swaps not in primary set
+
+class SketchCard(BaseModel):
+    hotel: HotelBlock | None
+    stay_missing_reason: str | None  # set ONLY on a card published with hotel=None on a shape
+                                     # that wanted one: lookup_failed | not_priced
+                                     #   | no_availability | filtered_out
 
 # 16 valid TasteField axes — any stroke axis not in this set is nulled
 _VALID_STROKE_AXES = frozenset({
@@ -121,5 +130,9 @@ _VALID_STROKE_AXES = frozenset({
 
 ## Gotchas
 - `no_inventory: True` and empty `sketches: []` are different UI states — `no_inventory` shows a "no rooms found" message; empty sketches is an error state
+- **`no_inventory` alone is not enough to phrase anything** — read `no_inventory_reason` first. Only `no_supply` (the city produced no candidate) may ever be spoken as a coverage claim. `lookup_failed` and `not_priced` are facts about US; `no_availability` is a fact about the DATES. Conflating them is how a Paris search printed *"We don't have hotel coverage in Paris yet"* twice on 13 Aug — once from a timed-out lookup, once from a degraded pricing sweep over three real Paris hotels (tickets 73/76)
+- **`degraded` on the LENS `complete` chunk is the hub telling us it failed** — its own words: *"an UNPRICED hotel is 'unverified', not 'gone'"*. `cognitive/lens_client.fetch_lens_prices(meta=…)` surfaces it as `meta["verified"]`, the same contract `shared/lens_recheck.py` has always had. Never treat an empty price dict as evidence of supply without checking it
+- **A card may arrive with `hotel: None` on a hotel shape.** That card kept a flight or a day plan the turn had already paid for — never render it as an empty stay or as "no rooms". **Read `SketchCard.stay_missing_reason`, NOT `hotel_lane_failed`, to phrase it**: the frame flag says only that the stay SEARCH did not answer, and it is frame-wide, whereas a deck can be mixed — one card keeps a substitute while its sibling is left without. Ticket 98: the shortlist SUCCEEDED (50 Paris hotels) and the pricing sweep returned nothing, so `hotel_lane_failed` was False and a card holding 100 live ranked fares was dropped, and the traveller was told the *flights* failed. The four words are `no_inventory_reason`'s plus `filtered_out` (stays WERE priced; none met the traveller's nightly cap / free-cancellation dial / budget — the only one of the four they can act on, and the one that must never read as "we couldn't get prices")
+- `_dna_shortlist_candidates` RAISES `ShortlistUnavailable` on any dependency failure and returns `[]` only for a genuine empty answer. Never re-collapse the two
 - `match_score` is display-calibrated (0–100 int) — it is NOT the raw floating-point match score from DNA shortlist. The raw score lives in the candidate dict before conversion
 - Stroke axis validation is silent — an invalid axis name from Haiku gets nulled with a log warning, not an exception. The rest of the stroke is still processed

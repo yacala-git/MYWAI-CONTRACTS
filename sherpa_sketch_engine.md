@@ -130,10 +130,176 @@ The card match % was computed by a 7-anchor piecewise-linear curve that lived ON
 **Consumer test:** `null` → none; else `"T" in value` → instant; else → bare date.
 
 - **`shared/sketch_types.py::normalize_supplier_deadline(raw) -> Optional[str]`** is the single normalizer. Value-preserving only: never adds a time to a date, never adds a zone to a naive instant, never derives a deadline from `check_in` (ticket 06 stands). `date`/`datetime` objects → `isoformat()`. Unparseable → `None` + a `cancellation_deadline_unparseable` WARNING (logged, not swallowed). Parsing is explicit rather than leaning on `date.fromisoformat` leniency, which differs across interpreters.
-- **Producers must call it** — `handler._apply_price`, the two AppSync publishes (`hotel_alternative_added`, `hotel_price_update`), the persisted `_wave2_alts` pool, and `sketch_engine.swap_block`'s rebuild. A `field_validator(mode="before")` on both models is the construction/`model_validate` backstop (these models do NOT set `validate_assignment`, so a plain attribute assignment bypasses it). The footer keeps mirroring the composed hotel verbatim.
+- **Producers must call it** — `handler._apply_price`, the two AppSync publishes (`hotel_alternative_added`, `hotel_price_update`), the persisted `_wave2_alts` pool, `sketch_engine.swap_block`'s rebuild, and `merge_rate_terms` on the undercut's frame write (ticket 81, below). A `field_validator(mode="before")` on both models is the construction/`model_validate` backstop (these models do NOT set `validate_assignment`, so a plain attribute assignment bypasses it). The footer keeps mirroring the composed hotel verbatim.
 - **Wire compat:** a bare date and an absent deadline serialize byte-identically to the old `date` field, so no existing consumer or persisted row changes. Only the previously-destroyed instant is new.
 - **Fixed in passing:** `swap_block` used `model_dump()` (not `mode="json"`) and `_handle_swap_block` returns straight out of the Lambda, whose runtime `json.dumps` has no `default=str` — so the old `date` OBJECT made every /swap response with a bare-date alternative fail to serialize. A string cannot.
-- **Not carried:** `/build/hotel-recheck` still returns availability + price only, no terms — unchanged by this ticket.
+- ~~**Not carried:** `/build/hotel-recheck` still returns availability + price only, no terms.~~ **Superseded 2026-08-15 by ticket 106** — the re-check now returns the fresh terms and the fresh rate (below).
+
+## Terms on the KEPT frame — an undercut carries them (2026-08-13, ticket 81)
+
+Ticket 53 fixed what a supplier swap **sends**; this is what it **keeps**. The wave-2 tail used to
+mutate `hotel.price_per_night` + `total_price` in place and stop, so the persisted frame could hold
+the NEW price beside the OLD supplier's refundability and deadline — and ticket 79's terms-only pass
+touched the frame not at all, so the answer just published was never written down. Dormant, not
+unreachable: ticket 52's undercut gate forces frame and event to agree only with *"Free cancellation
+only"* **ON**, and the dial is OFF by default.
+
+- **`shared/sketch_types.py::merge_rate_terms(chunk, *, previous_provider, previous_free_cancellation, previous_deadline) -> (Optional[bool], Optional[str])`** — the server mirror of the client's
+  `mergeRateTerms` (playground `rateTerms.ts`), same three branches: a chunk that **states terms**
+  (either field, via `states_supplier_terms`) is the authority for BOTH; a **silent** chunk from the
+  SAME supplier retains; a silent chunk from a **different** supplier CLEARS both to `null`. Cleared
+  is `null`, never `false` — ticket 06's third state. An empty provider id on either side is the wire
+  declining to say, not a switch (the buffered hub path omits `provider` on an update).
+- **`handler._carry_undercut_onto_sketch(owning, chunk, *, previous_provider, nightly, total, rate_ctx)`** applies
+  it to the owning sketch on BOTH tail passes: terms + `hotel.provider` (only when the wire named one)
+  + the footer's mirror of the terms, plus the price when it moved. `nightly`/`total` are `None` on a
+  terms-only pass — the stay is already on screen at that figure and the publish restates it, so a
+  frame write may not reintroduce a price movement. `previous_provider` is read from
+  `_published_rate[hid]["provider"]` BEFORE `_remember_publication` overwrites it.
+- **The frame is re-persisted after the tail joins.** `save_last_sketch_map` runs ~300 lines BEFORE
+  the tail, so an undercut used to reach the traveller's screen and never their stored trip. A second
+  targeted save fires only when the tail rewrote a sketch AND the tail actually finished (an
+  overrunning tail is still mutating those blocks). Log line `undercut_sketch_map_resaved`.
+- **Consumers of that frame, all now reading one rate:** the plan-edit footer + trip-map recompose
+  (`handler.py` `_handle_build_plan_edit`), the deferred day-plan compose (`_handle_plan_compose`) —
+  both rehydrate `last_sketch_map[sketch_id].hotel` and mirror its terms through `_build_footer` — the
+  hotel-lock rehydration fallback (map scan → `user_locked_hotel`), and the budget-v2 locked-nightly
+  fallback. The `/swap` pool is a SEPARATE store (`lens_alternatives`) whose price and terms come from
+  one chunk, so it is consistent by construction and untouched here.
+
+## A stay rate's IDENTITY and its EXPIRY (2026-08-15, ticket 106)
+
+**Ground truth first.** A live bounded probe of the LENS hub (`POST {LENS_HUB_STREAM_URL}/search-stream`,
+3 sweeps, Rome, 15 Aug 2026) shows a stay `result` chunk carries exactly
+`type · hotel_id · nightly_eur · nights · total_eur · currency · is_refundable ·
+cancellation_deadline · available · provider · latency_ms · seq` — **no `rate_key`, no `rate_code`,
+no room code, no board code, no validity window.** (The ACTIVITY lane genuinely does return
+`rate_key`/`rate_code`; stays do not.) The same sweep re-run ~7s later returned a different total
+(223.52 → 237.60) **and** a different cancellation deadline for the same hotel + provider, so a stay
+rate has **no supplier-side continuity at all** — every sweep mints a fresh one. "Is this still the
+same rate?" therefore cannot be asked of the supplier, only answered by comparing what we recorded
+against what came back.
+
+- **`shared/sketch_types.py::StayRate`** — the record. Both invented fields are LABELLED as invented
+  and nothing may drop the label: `id_source="derived"` (the id is a `derived-v1-<16 hex>` hash of
+  OUR facets, **never** a booking token — the `"supplier"` member is reserved for the day a real
+  `rate_key` exists) and `expiry_source="inferred"` (`expires_at = checked_at + STAY_RATE_TTL_SECONDS`;
+  contrast `FlightBlock.expires_at`, which IS the supplier's own offer expiry — the two look identical
+  on the wire and only this label separates them). `room_code`/`board_code` are always `null` today:
+  recorded-absent, not invented, because "the supplier does not say which room" is itself a fact.
+- **Identity = hotel · provider · check_in · check_out · pax_adults · room · board · free_cancellation ·
+  cancellation_deadline.** Terms are IN, because ticket 53 found a card inheriting terms after the rate
+  changed hands — a rate whose terms moved is a *different rate* and its id says so. `total`/`currency`
+  are OUT: "the price moved" is the event the re-price path exists to report, and currency is routinely
+  `null` = NOT TOLD (ticket 86), so hashing it would churn the id while saying nothing.
+- **`STAY_RATE_TTL_SECONDS = 1800`** — 30 min, §17 HTML:4265's *"gate the reveal at half an hour or so"*
+  taken literally. It is **ours**, a policy about how long we will show an unchecked price, not a window
+  anybody promised. **Ticket 82's reveal gate must READ this constant, never copy the number.**
+- **`build_stay_rate(price_rec, *, hotel_id, check_in, check_out, pax_adults, nights, checked_at?)`** —
+  THE one builder, called at all four LENS parse sites so they cannot drift: `cognitive/lens_client._process_chunk`
+  (both `result` and `update`), the `cognitive/handler` Phase-1 drain, the wave-2 tail's persisted
+  `_wave2_alts` pool row, and `shared/lens_recheck`. Takes the price-record shape those sites already
+  build (NOT a raw chunk). Non-finite `total` → `None` (a `Decimal('NaN')` would make DynamoDB reject
+  the whole swap-pool write). Never raises out of a parse loop; a failed stamp leaves the record
+  **unstamped**, which reads as stale.
+- **`stay_rate_is_expired(rate, *, now?)`** — `None`, unstamped and unparseable all read **expired**.
+  Deliberate direction: the cost is a re-check we did not need; the other direction serves a price
+  nobody checked.
+- **`compare_stay_rates(saved, fresh) -> StayRateComparison`** — `{same_stay, same_rate, changed[],
+  price_delta, price_comparable}`. Reports, never merges: there is no path through it by which the
+  saved rate's terms reach a rate that no longer states them. `price_comparable=false` (and
+  `price_delta=null`) whenever either side has no price or the units differ / are NOT TOLD — ticket 86
+  applied to arithmetic.
+- **Carriage:** price record → `HotelBlock.rate` (additive, default `null`, so every persisted sketch
+  and swap-pool row still parses) via `handler._apply_price`, which **copies** rather than rebuilds so
+  the card and its pool row share one `rate_id` and one `checked_at`. `_carry_undercut_onto_sketch`
+  **re-stamps from the MERGED block** (so a retained term is inside the new identity and a cleared one
+  is not); with no `rate_ctx` it drops `rate` to `null` rather than leaving a superseded stamp beside a
+  moved price. `sketch_engine.swap_block` **carries the persisted pool rate** instead of re-minting it —
+  re-stamping would reset the clock and make a 40-minute-old rate look freshly checked, which is exactly
+  what ticket 82's age gate must be able to see. `rate` is NOT in `_SKETCH_MAP_STRIP`.
+- **THE one re-price path** stays `POST /build/hotel-recheck`; tickets 82 and 32 come through it rather
+  than growing a second mechanism. See `sherpa_api.md` for its widened body/response.
+
+## Activity cancellation terms — a graduated SCHEDULE (2026-08-12, ticket 18)
+
+A stay quotes one deadline; an **experience quotes a schedule**. HotelBeds returns
+`operationDates[].cancellationPolicies[] = [{dateFrom, amount}]` — a list of breakpoints
+("from this moment, this amount applies"). Three hops discarded it: the Go adapter kept only
+`from`/`to`, `_build_facts` dropped even the surviving `free_cancellation` flag, and neither
+`ActivityBlock` nor `DayPlanItem` had a field for it.
+
+**Wire shape** — `cancellation_policies: Optional[list[{date_from, amount}]]`, in the
+**supplier's own order** (never re-sorted — a schedule read out of order is a different
+schedule).
+
+- `date_from` obeys the deadline contract above (instant / bare date), normalized by
+  `normalize_supplier_deadline`. HotelBeds quotes naive instants (`"2026-08-18T00:00:00"`),
+  which are the OPERATOR's own clock and are never re-zoned.
+- `amount` is the supplier's figure carried **verbatim**. Whether it is a charge retained or a
+  sum refunded is the supplier's convention and is **deliberately not asserted here** — a
+  renderer that wants to print "full refund" must establish that meaning first (one live probe).
+  The adapter and this contract guarantee only the numbers and their order.
+- **`None` is a value**: no schedule quoted, or one we could not carry. Never `[]` (which reads
+  as "no penalty, ever") and never collapsed to a single derived deadline.
+
+**Two normalizers, both in `shared/sketch_types.py`:**
+
+- `normalize_cancellation_schedule(operation_dates)` — reads the schedule off a priced LENS
+  offer. Returns `None` when: no operation date carried one; **any** breakpoint is unusable
+  (unparseable `date_from`, non-numeric `amount`) — a schedule is carried WHOLE or not at all,
+  because a graduated schedule missing its middle tier understates what a late cancellation
+  costs; or the operation dates carry **different** schedules (no single answer → we do not
+  invent one). Every drop logs `cancellation_schedule_dropped reason=…`. **Known and accepted:** an
+  operation date with NO policies is skipped rather than counted as a disagreement, so an offer with
+  one quoted and one silent window asserts the quoted schedule for the whole offer. Left as is —
+  such windows nearly always differ on `date_from` and drop anyway, and the schedule prints its own
+  dates.
+- `coerce_cancellation_schedule(raw)` — the same rules over an already-normalized raw list (a
+  persisted `plan_state.pool` row, where `amount` is a DDB `Decimal`). Never raises: a malformed
+  row costs the cancellation LINE, never the day-plan.
+
+**The four hops, end to end:**
+
+1. `fargate/activity-worker/main.go` → `mapCancellationPolicies` carries the supplier's list
+   verbatim onto each canonical `OperationDate` (`cancellation_policies`, `omitempty` so absence
+   emits no key). It filters and re-formats nothing — the adapter that discarded this data does
+   not get a second opinion about it. **`FreeCancellation` is a `*bool` here and on `hbRate`, not
+   a `bool`**: a plain bool decodes an OMITTED `freeCancellation` key to Go's zero value and emits
+   an asserted "non-refundable", which no later hop can tell from a supplier that actually said no.
+   With `*bool` + `omitempty` the three states reach the wire as key-absent / `false` / `true`, and
+   `chunk.get("free_cancellation")` resolves absence to `None`. `copyBool` detaches the flag from
+   the decoded response, which offers outlive.
+2. `lens_client.fetch_lens_activities` → derives `cancellation_policies` from `operation_dates`
+   (which are still carried untouched) and makes `free_cancellation` **TRI-STATE** — the old
+   `chunk.get(..., False)` asserted "non-refundable" on every activity whose supplier said
+   nothing (ticket 06's defect, mirrored on the experience).
+3. `sketch_engine._resolve_activity` → both fields onto the priced-pool row **and** onto
+   `ActivityBlock` (new `free_cancellation` / `cancellation_policies`, both default-null).
+4. `day_plan_engine._build_facts` (the hand-written key list that was dropping the flag) →
+   `_to_item` → `DayPlanItem`. **Anchors force both null** — a free landmark is never booked.
+
+Additive/opaque AWSJSON throughout — **no AppSync schema change** (same pattern as
+`rain_risk`/`price_stale`), default-null so every persisted record still parses.
+
+**Acceptance counter:** `lens_activities_done` now logs `terms=` (priced activities with a
+refundability flag at all) and `schedules=` (with a carryable schedule). `schedules=0` alongside
+`priced>0` means the supplier quoted none — not that the plumbing broke.
+
+**NOT built, recorded rather than silently omitted:**
+
+- **The operator-cancellation clause** §20 prints ("*also fully refunded if the operator cancels
+  for weather, or if too few travellers book*", HTML:5198-5199) has **no field in the HotelBeds
+  Activities availability response** — not in `rates`, `rateDetails`, `operationDates` or the
+  embedded `content` factsheet (whose fields are enumerated in
+  `mywai-product-search/docs/hotelbeds-first-feasibility.md:126-140`). Nothing was added for it:
+  a permanently-null field would be dead plumbing, and asserting the clause on our own authority
+  is exactly what §20 forbids at HTML:5346-5353. Ticket 29 renders silence for that line.
+- **The 25k harvested Viator rows.** §20 step one ("a cancellation role in the mapper's fixed
+  list") is a **different repo and a schema change**: the role list is
+  `analyst_agent._FACTORY_IDENTITY_OPTIONAL` in `mywai-hotel-providers`, and the data is
+  `viator_products_cancellationpolicy_refundeligibility` (25,232 rows). Reaching it needs a new
+  role + a canonical column + a re-shred, and Viator is not a live LENS pricing provider today.
 
 ## `SketchFooter.pax_adults` — authoritative (verified 2026-07-06)
 `pax_adults` is fully resolved in `handler.py` (produce_intent → `_extract_trip_params`, then trip-type/family defaults) BEFORE `run_sketch_engine`, threaded through `_compose_one_sketch` → `_build_footer(pax_adults=...)`, and persisted to `trip_slot["pax"]["adults"]` (restored on the committed fast-path). So `footer.pax_adults` always carries the resolved value — the UI can drop its `TRIP_TYPE_PAX` pill re-derivation. No code change (verification task).
@@ -145,6 +311,7 @@ The card match % was computed by a 7-anchor piecewise-linear curve that lived ON
 | `tests/cognitive/test_triptych_ranks.py` | `_triptych_rank_depths` invariants + deck pick (hero=pool[0], distinct, no dup) + variation_value picker unchanged |
 | `tests/cognitive/test_swap_score_carry.py` | swap alternatives carry persisted match_score/codon_contribs/dna_boost (not 0) |
 | `tests/cognitive/test_cancellation_deadline_instant.py` | the deadline's three wire states (instant / bare date / none), the normalizer, model rehydration of legacy rows, /swap producer + JSON-serializability, ticket-06 non-regression |
+| `tests/cognitive/test_activity_cancellation_terms.py` | ticket 18: a graduated schedule survives as a schedule (order preserved), the deadline obeys ticket 40, all-or-nothing drops (unusable breakpoint / disagreeing windows / non-numeric amount) log and yield `None`, DDB-Decimal round-trip, both models' wire shape + legacy rehydration, the pool→fact→item hops, anchors state no terms, LENS + re-check tri-state |
 
 ## Landmark proximity resolution (2026-05-25)
 
@@ -168,6 +335,36 @@ The card match % was computed by a 7-anchor piecewise-linear curve that lived ON
 |-----------|---------------|
 | `tests/cognitive/test_landmark_resolver.py` | 10 unit tests (mocked DDB + Bedrock): no-phrase guard, DDB hit, DDB miss→Haiku, Haiku null, Haiku error, TTL cache |
 | `tests/cognitive/test_landmark_resolver_live.py` | 5 live tests (`SHERPA_INTEGRATION=1`): Arc de Triomphe DDB hit, Place Dauphine Haiku fallback, Rue de Rivoli, Paris bbox validation, cache latency |
+
+## Stay settings dials — the four non-amenity filters + their echo (2026-08-13, ticket 52)
+
+The stay sheet's STARS / AREA / RATE / nightly-cap controls are typed `pre_context` fields (shape: `contracts/sherpa_api.md`), applied here and **echoed back on the frame** so the sheet renders the search rather than its own memory (§17, HTML:4143 — "the chip state coming from what the server echoes back").
+
+**Where each one cuts** — three doors, and every one of them is guarded, because §17's invariant is that *every stay shown satisfies every chip shown as active*:
+
+| Dial | Applied | Where |
+|------|---------|-------|
+| `stars` | `user_constraints["stars_min"]` → `_compose_hotel_filters` → Aurora `WHERE stars BETWEEN :min AND :max` | retrieval |
+| `area` | geocoded server-side (`handler._resolve_stay_area_geo` → `landmark_resolver.resolve_base_location_geo`, >50 km-from-city guard) → passed to `_search_and_rank_hotels(area_geo=…, area_geo_wins=…)` → the SAME `geo_lat/lon/radius_m` filter a proximity message produces | retrieval |
+| `rate.free_cancellation_only` | post-pricing on the tri-state `is_refundable`; `None` (nobody told us) is DROPPED, not treated as free | LENS merge |
+| `nightly_cap` | post-pricing on `nightly_price`, **HARD — no `_BUDGET_FLEX`**. The tier cap beside it carries 20% because the tier is an inference; a number the traveller dragged is not | LENS merge |
+
+**PRECEDENCE — it turns on where the dial came from, and getting this wrong is a shipped defect class.** A dial the traveller just moved AT THE SHEET is an explicit control and wins outright. A dial read back out of the persisted slot is a MEMORY, and a memory may never outrank what the traveller just said — §17 gives the chat *"anything the pills do not cover — 'nearer the river'"* (HTML:4104), and the interface has no way to show that it ignored you (same shape as ticket 56).
+
+- **stars:** `shared.stay_dials.resolve_star_floor(dial, already_set, from_sheet=…)`. From the sheet → overwrite. Carried → FILL only what nothing else set; when something else did, this turn wins and the DIAL FOLLOWS it, so the slot and the echo describe the search rather than the memory.
+- **area:** three-way, in `_search_and_rank_hotels` — sheet-this-turn (`area_geo_wins=True`, message resolver not consulted at all, since two anchors would AND into an intersection neither describes) > a place named in THIS TURN's message > the carried area as fallback. The slot then follows the geo the search ACTUALLY used (read off `lattice_summary["landmark_geo"]` at the trip_slot build, which is after the engine ran), so a chat "near the Colosseum" that outranked a carried area is what the sheet reopens on.
+
+The two post-pricing dials run through ONE predicate (`shared.stay_dials.price_row_passes`, wired as `handler._stay_price_ok`) at **all FOUR doors** a stay can reach the traveller through: the primary sketch, the substitution/alternatives pool, the wave-2 `hotel_alternative_added` that feeds `/swap`, and the wave-2 **UNDERCUT** (`hotel_price_update`). The fourth is the easy one to miss — it sits fifty lines below the third in the same loop, and it re-prices a stay that is ALREADY ON SCREEN while publishing the new rate's terms, so an ungated undercut lands a cheaper NON-refundable rate under an active "free cancellation only" chip (ticket 53's defect through another door; ~20% of simulated supply is non-refundable). It also drops terms-less `update` chunks, which carry no terms at all. `tests/cognitive/test_stay_dials.py::test_every_door_a_stay_reaches_the_traveller_through_is_gated` is a structural pin against a fifth door opening ungated.
+
+**The echo — `SketchFrame.stay_filters`** (`shared/stay_dials.StayFiltersEcho`, one `StayDialEcho` per dial: `{requested, applied, state, note}`). `applied` is the only field a chip may light up from; it is `null` for every non-`applied` state. Four states, and deliberately no fifth: `applied` · `unresolved` (an area nothing could place) · `unsupported` (`breakfast_included` — LENS returns a total, a nightly rate, a provider and cancellation terms, and **no board/meal plan from any provider**, so nothing could answer it) · `off`. There is NO `relaxed`: §17 relaxes a WANT amenity visibly below five results, but a stars floor or a cap that empties the pool leaves an honestly short list with the true denominator, never a quietly widened one.
+
+`stars` and `area` echo the EFFECTIVE filter, not the sheet's request — so a floor or an anchor the traveller set in the CHAT is echoed too (`requested: null, applied: …`). That is the other half of the invariant: *a chip the user cannot see may never cut the results*.
+
+**Carry-forward:** persisted at `slots.trip.stay_dials` (written from the parsed object, all-off writes no key). A turn whose `pre_context` carries any of the four keys REPLACES the set whole; a chat refine carrying none keeps it. Logs: `stay_dials_resolved`, `stay_area_geo_applied`, `stay_area_out_of_city`, `stay_dial_stars_yielded_to_turn`, `stay_dial_area_followed_search`, `lens_undercut_dropped_stay_dials`, and `lens_sketch_substituted reason=stay_dials`.
+
+| Test file | What it covers |
+|-----------|---------------|
+| `tests/cognitive/test_stay_dials.py` | parse/degrade, both price-gate dials, echo states, the retrieval filters, the area>message precedence, and the REAL `/turns` forwarder round-trip |
 
 ## Session amenity injection (2026-05-27, updated 2026-05-27)
 
@@ -302,7 +499,7 @@ Replaces the dead `search_activities` stub + hardcoded placeholder prices with a
 ### LENS activity client (`cognitive/lens_client.py`)
 
 - `stream_lens_activities(activities, from_date, to_date, paxes, language="en", timeout=20)` — mirrors `stream_lens_flights` via the shared `_stream_lens` transport, POSTing `/activity-search-stream`. Payload `{"activities", "from", "to", "paxes", "language", "type": "activity"}`.
-- `fetch_lens_activities(...)` — blocking collector mirroring `fetch_lens_flights`. Keeps `type=="result"` chunks, returns `dict[activity_code -> {price, currency, name, free_cancellation, duration_min, rate_key, pax_amounts, operation_dates, sessions}]`. `{}` on any error / no inventory (never raises).
+- `fetch_lens_activities(...)` — blocking collector mirroring `fetch_lens_flights`. Keeps `type=="result"` chunks, returns `dict[activity_code -> {price, currency, name, free_cancellation (TRI-STATE), cancellation_policies, duration_min, rate_key, pax_amounts, operation_dates, sessions}]`. `{}` on any error / no inventory (never raises). See "Activity cancellation terms" above for the two cancellation fields.
 - **JOIN key = `activity_code`** (== the candidate's `provider_ids[].external_id`). Empirically verified 2026-07-08: there is **NO `offer_id`** on activity result chunks. `price` = the FULL BOOKING TOTAL for the exact `paxes` sent (scales sub-linearly 1→2 adults; private tours have a fixed base) — trust it directly, do NOT reconstruct from `pax_amounts`. ~15% availability hit-rate; only priced activities return.
 
 ### DNA retrieval (`_dna_activity_candidates(user_id, city, taste_field, limit=20)`)
@@ -323,7 +520,7 @@ Signature widened with `check_in, check_out, adults, children`. The stub tool (`
 **Return (increment B1):** `(Optional[ActivityBlock], list[dict])`. The **first element is byte-identical to the pre-B1 selection** (first priced by taste) — no behaviour change to the selected block, `_build_footer`, `total_all_in`, or the AppSync payload. The **second element is the FULL priced pool** in taste-rank order: one raw dict per PRICED candidate (unpriced excluded), **retained for the B2 day-plan composer** and currently **DORMANT (unread)**. Every degrade path (missing dates / no rows / no payload / no prices / zero priced / blanket `except`) yields `(None, [])`.
 
 **Priced-pool dict shape** (per priced candidate) — carries everything the composer needs that `_resolve_activity` previously computed then discarded:
-`master_id` (= row `provider_id`), `external_id`, `activity_code` (both = LENS join key), `provider_ids` (optional/additive — `[{provider, external_id}]`, the join-keys carried onto the saved cart line + `DayPlanItem` for a later LENS re-price; see the activity-recheck path), `title`, `price` (RAW LENS booking total), `currency`, `lat`, `lng` (anchor `lng` convention; sourced from the live top-level row `lat`/`lon` with a nested-`geo` fallback), `duration_min` (raw LENS), `duration_minutes` (DNA row), `sessions`, `operation_dates`, `free_cancellation`, `rate_key` (all from the LENS priced dict), `category`, `codons`, `usps`, `landmarks` (`metadata.landmarks` → top-level `landmarks` fallback → `[]`), `images_s3`.
+`master_id` (= row `provider_id`), `external_id`, `activity_code` (both = LENS join key), `provider_ids` (optional/additive — `[{provider, external_id}]`, the join-keys carried onto the saved cart line + `DayPlanItem` for a later LENS re-price; see the activity-recheck path), `title`, `price` (RAW LENS booking total), `currency`, `lat`, `lng` (anchor `lng` convention; sourced from the live top-level row `lat`/`lon` with a nested-`geo` fallback), `duration_min` (raw LENS), `duration_minutes` (DNA row), `sessions`, `operation_dates`, `free_cancellation` (TRI-STATE), `cancellation_policies` (the graduated refund schedule — ticket 18), `rate_key` (all from the LENS priced dict), `category`, `codons`, `usps`, `landmarks` (`metadata.landmarks` → top-level `landmarks` fallback → `[]`), `images_s3`.
 
 > **⚠️ Row-shape drift (flagged for B2):** the live activity row from `activity_codon_search` carries `lat`/`lon` **top-level** (`ST_Y`/`ST_X`) and `primary_landmark` (a single string) — **not** a nested `geo` dict nor a `landmarks` list. B1 sources geo/landmarks defensively (top-level-first for geo, `metadata.landmarks`→top-level for landmarks, else empty) so it is correct against the live shape today; `landmarks` will typically be `[]` until backend fill lands. B2 should confirm the canonical geo/landmark source before consuming these.
 
@@ -358,6 +555,7 @@ DayPlanItem   { item_id, kind: "activity"|"anchor", day_index, day_part: "mornin
                 title, why, lat?, lng?, price?, entrance_fee_estimate?, start_time?, image_url?,
                 usps: list[str], currency, duration_hours, booking_required,
                 provider_ids?, activity_code?, rate_key?,   # optional/additive — LENS re-price join-keys (activity items only)
+                free_cancellation?, cancellation_policies?, # optional/additive — supplier terms, ticket 18 (activity items only; anchors forced null)
                 alternatives: list[DayPlanItem] }
 DayPlanDay    { day_index, date?: ISO-str, items: list[DayPlanItem] }
 DayPlan       { days: list[DayPlanDay] }
@@ -568,7 +766,21 @@ Invariant: `activities_active AND effective_budget > 0 AND remainder_after_locks
 - **Pins (`user_plan_pins`, constraint cell, cleared_parts family):** HARD membership honored on every later compose — bypass weather-hard (rain_risk badge stays), budget drop, day-trip isolation; pin-aware overlap arbiter (pin shifts → cornered pin evicts the non-pinned clasher (no cascade, day never empties) → pin-vs-pin kept); `_ensure_pins` belt has backfill-grade slot eligibility (never cleared/suppressed/day-trip-day). A pin fixes membership, never position. Released only by whole-state RESET (family behavior).
 - **Pin pricing dropout (guru condition, closed):** the main-turn compose pool unions persisted plan_state.pool rows for pinned ids absent from fresh pricing (`_carry_pinned_stale_rows`) — carried rows and their items flag `price_stale: true` (additive DayPlanItem field); logs day_plan_pin_stale_price. A factless, non-excluded pin logs day_plan_pin_unavailable (user-choice loss is never silent).
 - **plan_state (persisted per trip, single shared blob):** {day_plan, pool, anchors, params, per_sketch:{sketch_id:{variation_value, hotel_geo, hotel_id}}} captured at compose (`hotel_id` added 2026-08-03 by S1 — it is what lets the finalize step match the trip's locked/committed hotel into a trip-keyed `params.hotel_ctx`, and what makes an exact per-sketch hit identifiable) (SketchFrame._plan_state PrivateAttr — never serializes to AppSync), persisted via the single-slots-arg path (UpdateExpression proof-test guards the duplicate-path ValidationException). TODO(cap-removal): conditional/versioned write before parallel turns.
+- **The refusal SENTENCE rides the patch — `sketch_patch.reply_text` (2026-08-14, booking-flow ticket 92; built, NOT deployed).** A refused edit publishes the unchanged plan AND the reason on **ONE** mutation: the optional `reply_text` string is present only when there is something to say (absent, never `""`, on a successful edit, so a UI cannot render a blank bubble). It replaces the separate `text` block that used to go out at seq 9 ahead of the patch + `done` at seq 10 — AppSync orders nothing across mutations and both UIs settle + close the socket at `done`, so the sentence could reach a socket that no longer existed and the traveller was refused in SILENCE (four frames measured landing `s7, s4, s6, s5` within 8ms on a live turn). Same rule on the CHAT path (`_dispatch_chat_plan_removals`): when the turn produced a patch the reply rides it as `reply_text` at seq 3 done — including a SUCCESSFUL "Removed X from your plan"; when it produced no patch (ambiguous ask, name matched nothing) the `text` block is itself the closing frame and was never in a race. **UI contract: read `reply_text` off any block IN ADDITION to `text` blocks** — the demo (`ui/src/lib/assistantReplies.ts`) and the playground (`AgentPlayground.tsx` plan-edit socket + the /turns stream) must both do this, and clients ship BEFORE the server (the field is additive and inert until then).
 - **Known deferred:** route trusts body user_id/trip_id like its siblings — folded into the pre-launch multi-tenancy fix (now a WRITE path).
+
+## `add` — the fourth day-plan op (2026-08-12, booking-flow ticket 19 / §19; built, NOT deployed)
+Design: `mywai-demo/docs/booking-flow-design/BOOKING_FLOW_DESIGN_2026-08-07.html` §19 — *"Adding needs a real operation, not a client trick… Add has to exist server-side, drawing on the same pool, or the control is a facade"* (HTML:4806).
+- **Wire (same route, TWO phases):** POST /build/plan-edit `edit:{op:"add", day_index:int, day_part:"morning"|"afternoon"|"evening", to_item_id?}` → 202. **Phase 1** (no `to_item_id`, the traveller tapped an open slot) publishes ONE `plan_add_candidates` block `{sketch_id, day_index, day_part, candidates:[DayPlanItem…], next_action:"PLAN_UNCHANGED"}` seq=10 done — read-only, persists nothing. **Phase 2** (with `to_item_id`) runs the normal edit core and publishes the usual `sketch_patch`. Fresh turn_id per request, so (seq,type) cannot collide.
+- **The candidate pool is the PLANNER'S OWN, server-side.** `day_plan_engine.add_candidates` reads `plan_state["pool"]` + `plan_state["anchors"]` — literally the two lists `compose_day_plan` was called with, returned by the same statement that composed the plan (`sketch_engine._compose_day_plan_core`). The swap lists (`_alternatives_for`) cannot serve add: each hangs off an ALREADY-PLACED item, so an empty slot has none. Admission is the composer's own three calls — `_admissible` + `_slot_under_cap` + `_slot_clock_free` — against the day's current occupancy; order is `taste_rank`, the floor's own key (no second ranking policy), with `_alternatives_for`'s wet-day outdoor demotion. Withheld: anything already placed, anything on `user_excluded_blocks` (remove stays irreversible — an add that re-offered a removed item would be an undo), and any paid activity that would breach `activities_ceiling_abs` (so a `diy_anchors` trip at €0 offers free anchors only). Capped at `_MAX_ADD_CANDIDATES` (8).
+- **DAY-TRIP ISOLATION is enforced at ADMISSION, both directions** (gate finding, 2026-08-12 — the first pass had this hole). The edit `SlotCtx` models no day-trip days, so `add_candidates` seeds `ctx.day_trip_days` from the PLACED plan exactly as the two membership belts do (`_ensure_pins:1583`, `_ensure_child_slot:1662`) — without it `_admissible`'s clause 4 read an empty set and in-city items were offered into the other parts of a Versailles day. And an `is_day_trip` candidate is offered ONLY into an EMPTY day: the floor may place a day-trip on an occupied day and let `_enforce_day_trip_isolation` DROP the cohabitants afterwards, a repair an edit must never make. **The claim the function makes is "would have placed it there AND KEPT it", not merely "placed"** — those differ, and the difference is where this was wrong. Non-self-healing if breached: an added item is a HARD PIN and isolation exempts pins (`membership > isolation`), so a violation would survive every later rebase. Both halves are independently falsifiable (each alone leaves 2 of the 4 day-trip tests red).
+- **Weather is deliberately an ORDERING, not a filter** — the discriminator being that `_apply_weather` exempts PINS from its hard drop and an added item becomes a pin (as a swap-in does), while day-trip isolation bends for nobody at any edit site. Every other composer repair pass was checked against the offer: `_enforce_no_repeats` (covered by the placed-id filter), `_resolve_time_overlaps` (`_slot_clock_free`), `_enforce_density` (`_slot_under_cap`), `_enforce_activity_budget` (the ceiling filter), `_normalize_parts` (`_admissible` clause 5 + `_to_item`); `_ensure_pins` / `_ensure_child_slot` / `_backfill_empty_days` are fillers, not admission rules.
+- **The id is re-validated inside the op.** `apply_plan_edit("add")` recomputes `add_candidates` for that exact slot and refuses anything not in it (`notes.unplaceable_reason="not_offered"`, plan returned untouched, membership guard refuses, nothing persisted, the traveller gets an add-specific sentence via `PlanEditRefusal.incoming_op="add"`). One function is both the offer and the gate, so a client-supplied id can never enter the plan.
+- **Slots are preserved.** `_insert_in_place` — the mirror of `_drop_in_place` — puts the built card at its chronological position on the NAMED day and touches nothing else; a day the plan omits (item-less days are not emitted) is re-created in day order. It deliberately does NOT use `_place_item`: that walks the trip's days, which is right for a swap and would make add a day-search — one generalisation from the move op §19 cuts permanently (HTML:4808 / SETTLED HTML:5516). Membership: `_expected_membership` gains a conserving `add` arm (`current + to_item_id`). The added item becomes a HARD PIN, like a swap-in.
+- **BOTH whitelists extended** (`api/handler.py` `/build/plan-edit` 400s an unknown op; `cognitive/handler.py` `_handle_build_plan_edit` drops one) and `day_index`/`day_part` added to the api forwarder's field-by-field `_edit_out` allowlist — `day_index` forwarded as Optional-int because 0 is Day 1, `day_part` dropped to `""` unless it is a real part.
+- **Chat is NOT wired (ruling).** `add` is a typed op only. The edit-IR resolver matches titles against `plan_state.day_plan` and never the pool, so an add target (by definition not on the plan) is unreachable by it; and a chat add carries no slot, which would force the server to choose a day — the exact inference the move cut forbids.
+- **Refactor rider:** the swap branch's inline edit `SlotCtx` is now `_edit_slot_ctx(params)`, shared verbatim with add so the offered set and the accepted set are judged against one calendar.
+- **Owed:** one live turn + a DDB turn-log grep for `plan_add_candidates` before any UI is built on it (the forwarder-drop class has fired four times here).
 
 ## ComposeParams rail + trip-keyed hotel binding + edit-IR state bypass (2026-08-03, activities chat-edit S1 — built, NOT deployed)
 Spec: `mywai-sherpa/docs/ACTIVITIES_CHAT_EDIT_STUDY_2026-07-26.md` (§B findings A2a/A2b/A5a, the guru convene verdict + the second pass's two mandatory conditions). Backend-only; **no AppSync shape change**.

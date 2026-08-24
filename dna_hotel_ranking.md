@@ -54,12 +54,19 @@ The shortlist **response body** now carries a top-level `scored_intents: list[st
 - `match_score_v2` stored in candidate but NOT used for ranking — collected for offline A/B comparison
 - Flip criterion: ≥2 weeks of A/B logs showing v2 top-1 better-aligns to user follow-up signal
 
-## Scoring trace (2026-05-23)
+## Scoring trace (2026-05-23, shape fixed 2026-08-12)
 `_calculate_match_score` returns a 6-tuple — the 6th element is a `_trace` dict exposing the intermediate components:
 ```python
-_trace = { "dna_cos": float, "jacc": float, "pen": float, "qual": float, "ax": float, "arch": float }
+_trace = { "dna_cos": float, "taste": float, "tier": float, "pen": float,
+           "qual": float, "ax": float, "arch": float, "no_codons": bool }
 ```
 This is used by the per-hotel CloudWatch log `hotel_scored` (see Observability section) and is NOT added to the API response body.
+
+**The trace carries these keys on EVERY path.** A hotel with no codons (a skeleton row — ~241 exist in
+Aurora) cannot be taste-scored and returns `0, 0.0, False, [], {}, <zeroed trace with no_codons=True>`.
+It used to return an empty dict there, which the `hotel_scored` log line indexed unconditionally — one
+skeleton row raised `KeyError: 'dna_cos'` and 500'd the whole shortlist (booking-flow ticket 51). Any
+new consumer of the 6th element may index it directly; do not reintroduce a second shape.
 
 ## Key files
 | File | Function | Purpose |
@@ -90,6 +97,7 @@ match_score = min(100, match_score + round(_am_boost * 100))
 |-----------|---------------|
 | `tests/test_shortlist_core.py` | Score formula, weight application |
 | `tests/test_stay_v2_scoring.py` | STAY v2 codon scoring |
+| `tests/test_shortlist_codonless_hotel.py` | A codon-less hotel is scored/logged/ranked, never raises (ticket 51) |
 | `tests/integration/test_t3_retrieval.py` | End-to-end ranking quality |
 
 ## CloudWatch log events (search traceability — 2026-05-23)
@@ -97,7 +105,8 @@ Per-search events emitted by `dna-shortlist/handler.py`:
 
 | Event | When | Key fields |
 |-------|------|------------|
-| `hotel_scored` | once per candidate | `pid`, `name`, `match`, `dna_cos`, `jacc`, `pen`, `budg` (BUDG codon list) |
+| `hotel_scored` | once per candidate | `pid`, `name`, `match`, `dna_cos`, `taste`, `tier`, `pen`, `budg` (BUDG codon list), `codons` (usable codon count — `codons=0` is a data gap, not a bad match) |
+| `hotel_no_codons` | WARNING, per codon-less candidate | `pid`, `name` — a skeleton row reached the ranker (retrieval widened, or the labeller never ran on it) |
 | `ranked_top10` | once per request after sort | array of top-10 `{rank, pid, name, stars, match, budg}` |
 
 Per-search events emitted by `mywai-sherpa/cognitive/sketch_engine.py`:
