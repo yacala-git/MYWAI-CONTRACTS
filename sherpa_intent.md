@@ -175,6 +175,48 @@ later. A guessed window is still USED (the trip has to plan against something) a
 confidence gate there still only decides whether the phrase was UNDERSTOOD, not who chose it.
 A guess becomes a choice when the traveller states or taps the days (`_set_cell` endorsement).
 
+**The THIRD door: `pre_context` (2026-09-10, backlog 13p).** A planning surface that already holds
+the answer seeds it straight into the trip slots (`_handle_conversational_turn`, turn-0 only). That
+door has no phrase and no IR, so provenance cannot come from a kind — it comes from the TILE the
+traveller tapped, stated in `_WHEN_WINDOW_IS_THEIRS` and read by `_precontext_window_is_committed`:
+`pick_date` / `this_weekend` / `next_month` / `3_6_months` commit (a rough preset's derived days are
+only ever SHOWN for confirmation, so a concrete window arriving with one was accepted), and
+`dreaming` does NOT — "Just dreaming" still sends a concrete window (the client's +60d/5-night
+SAMPLE, so the deck is not priced against today) and that window is ours, not theirs. An absent or
+unrecognised `when` defaults to committed, which keeps every non-quiz sender unchanged. Before this
+the seed stamped `dates_user_committed=True` on anything arriving in `pre_context.dates` — reading
+the commitment off the TRANSPORT — so a dreamer's deck hard-excluded long-haul destinations on an
+invented trip length and counted down to a departure nobody named.
+
+**Quiz tile → session codons (`pre_context.mood`, tickets 186 + 188, 2026-09-19).** When the quiz's
+mood step was answered (`pre_context` carries a truthy `mood`, including `'none'`), `handler.py`
+`_seed_codons_for(mood, trip_type)` seeds the turn's session codons = `_SEED_MOOD_TO_CODONS[mood]`
++ the party fact from `_SEED_PARTY_FACT_CODONS[pre_context.trip_type]` (`family` → `SOC#FAM`,
+`business` → `PURP#WORK`; couple/solo/group add nothing), order-preserving, de-duplicated. A tapped
+tile's codons REPLACE Sonnet's `produce_intent` codons for the turn (`_resolve_discover_session_codons`),
+so without the party fact a seeded tile would delete the family/business fact floor. Rows:
+
+| wire mood | tiles | codons (first = gate where one exists) |
+|---|---|---|
+| `city` (new) | City days | ACTV#SGHT · CULT#ARCH · DEST#HIST · CULT#ARTG · FOOD#CAFE |
+| `city_extend` (new) | Add a city (business) | `city` + FOOD#GAST |
+| `beach` (new) | Sun & sea, Add beach days | DEST#BEAC · DEST#COAS · FOOD#SEAF · DEST#WARM |
+| `theme_parks` (new) | Big days out (family) | ACTV#PARK · ACTV#SHOW |
+| `outdoors` (re-pointed) | Into the wild / Fresh air | ACTV#HIKG · DEST#MTNS · DEST#NATL · DEST#LAKE · ACTV#SAFR (no WALK/BIKG, no MOOD#ADV) |
+| `romantic` | Just us | MOOD#ROMN · FOOD#WINE · CULT#ARCH · FOOD#FINE (DEST#COAS dropped — it turned the deck all-coastal) |
+| `nightlife` | Nights out, Stay for the weekend | MOOD#SOCS · ACTV#NGHT · CULT#MUSC · FOOD#BEER · ACTV#FEST |
+| `wellness` | Reset | WELL#SPAS · MOOD#WELL · WELL#THRM · DEST#LAKE · DEST#FORE |
+| `'none'` | Get it done, untagged tiles | nothing — party fact only |
+
+- Unknown/non-str mood → `[]`, party fact included (no seeding on a guess). `adventure`/`relax`/`foodie`
+  rows are unchanged and no tile sends them.
+- A sort codon may carry no mood-filter key or only its own mood's key; under `DEST_MOOD_ONCE` the
+  mood-role gate codons are stripped from coverage, so the rest of the row is the whole sort.
+  Every codon must be in `intent._VALID_SESSION_CODONS` (asserted in `tests/cognitive/test_precontext_seed.py`).
+- **Beach flag.** `sketch_engine._dna_mood_filter_for` adds `mood_filter["beach"] = True` to the
+  DNA-bound request when `DEST#BEAC` is in the turn's WINNING session codons (tile, typed, or carried);
+  key absent otherwise. `DEST#COAS` alone never sets it. DNA side: `contracts/dna_hotel_search.md`.
+
 **Flight delta fast-path (2026-06-19):**
 Once a destination is committed, `_apply_flight_delta` is called on every turn to detect cabin/direct/origin/dest changes without an LLM call. It receives `trip_shape` and `hotel_locked` context:
 - `trip_shape == "hotel_only"` → returns immediately (no flights on this trip)

@@ -119,8 +119,8 @@ biz_query  = _is_biz_query(codons)          # UNCHANGED — reads the merged set
   `gate_codons=list(intent_codons or [])` ALWAYS. `[]` means "nothing stated" and closes the
   four gates; `None` (any other caller) preserves legacy merged behaviour.
 - **`gate_codons` ≡ the 5x tier exactly.** `intent_codons` is verified pure — built only
-  from this-turn LLM extraction, a static `pre_context.mood` seed table, or same-session
-  carry-forward of either. No `taste_field`/DNA path reaches it.
+  from this-turn LLM extraction, a static `pre_context.mood` seed table (+ the party fact
+  from `pre_context.trip_type`), or same-session carry-forward of either. No `taste_field`/DNA path reaches it.
 - **Business is the deliberate exception.** Its carrier `DEST#URBN` is injected at DNA-hint
   tier on purpose (TC-08) and `business_intent` can be True with NO `PURP#WORK` present
   (Sonnet sets it from a connectivity phrase). Gating it on stated intent would switch
@@ -141,6 +141,29 @@ biz_query  = _is_biz_query(codons)          # UNCHANGED — reads the merged set
 - **Trap.** These gates are now load-bearing on the fold at `sketch_engine.py:5739` that
   merges `session_intent_codons` into `intent_codons`. `dna-api`'s destinations branch never
   reads `session_intent_codons`. Remove that fold and every gate goes silent, with no error.
+
+## Destination beach floor — `DEST_BEACH_FLOOR` (ticket 188, 2026-09-19)
+
+A beach turn QUALIFIES on `beach_score`, same gated-CASE shape as the wellness floor.
+
+| hop | field | value / when |
+|---|---|---|
+| SHERPA → dna-api | `body.mood_filter.beach` | `true` when `DEST#BEAC` ∈ the turn's winning session codons; key absent otherwise (`contracts/sherpa_intent.md`) |
+| dna-api → dna-shortlist | same | forwarded unchanged |
+| dna-shortlist → pg_client | `beach_floor` | `_dest_beach_floor(mood_filter)`: config `DEST_BEACH_FLOOR`/`beach`, else 42.0; `None` unless flag on AND key true |
+| SQL (all three destination templates) | `AND (NOT :beach_floor_on OR COALESCE(d.beach_score,0) >= :beach_floor)` | — |
+
+- **Flag `DEST_BEACH_FLOOR` (env on dna-shortlist), default OFF.** Off → the predicate token is the
+  empty string and every destination SQL is byte-identical (`tests/test_dest_beach_floor.py`). Flip
+  only after the no-LLM deck measurement.
+- **Armed by `mood_filter["beach"]` ONLY** (`pg_client._is_beach_intent`), never by `_is_beach_query`:
+  that set includes `DEST#COAS`, which would give a coastal-romance turn a beach floor. The 0.60
+  beach ORDER-BY boost stays on `beach_query`, untouched.
+- Own config kind (`DEST_BEACH_FLOOR`), not `DEST_MOOD_FLOORS`. Missing/non-numeric value → 42.
+  An empty deck falls to the existing near-miss tier; nothing raises. Log: `dest_beach_floor_applied`.
+- The quiz party facts (`SOC#FAM` / `PURP#WORK`, seeded from `pre_context.trip_type`) reach the
+  family/business fact floors through the normal `fam_query` / `biz_query` / `mood_filter` paths;
+  no DNA change was needed for them.
 
 ## STAY.TIER → BUDG codon derivation (2026-05-23)
 
