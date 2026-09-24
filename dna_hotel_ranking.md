@@ -1,6 +1,6 @@
 # DNA Hotel Ranking
 
-**One line:** Scores each hotel candidate with a weighted formula: 60% DNA cosine + 28% intent Jaccard + 12% quality, plus optional axis bonus, archetype bonus, and amenity boost (capped 20 points).
+**One line:** Scores each hotel candidate with a weighted formula: 60% DNA cosine + 28% intent Jaccard + 12% quality, plus optional axis bonus and amenity boost (capped 20 points).
 
 ## What it does
 - `_calculate_match_score` in `dna-shortlist/handler.py` computes a 0–1 score and calibrates it to a 0–100 int for display
@@ -8,7 +8,10 @@
 - Intent Jaccard = overlap between intent codons and hotel codons (unweighted)
 - Quality = normalised hotel star rating (0.0–1.0)
 - Axis bonus = up to +0.15 from vibe/stay/food/wellness chromosome overlap (from Aurora `dna_full` column)
-- Archetype bonus = overlap between user archetype and hotel `archetype_weights` JSONB
+- Archetype bonus = **RETIRED 2026-08-29** per `mywai-dna/docs/ARCHETYPE_REDESIGN.md` §4/§7-P3.
+  `_ARCHETYPE_CODONS` and `_archetype_fit_score` are deleted. It had been disarmed (not inert) by
+  the DDB value `ARCHETYPE_BONUS_CAP = 0.0`, while the in-code default was `0.08` — one failed
+  config read from going live with 15 dead codon ids of 34. Removal measured at zero delta.
 - Amenity boost = `min(matched_codes × 0.03, 0.20)` — additive, capped at 20 points — added AFTER the base score is computed
 
 ## Score formula
@@ -16,7 +19,6 @@
 # Default weights
 base = _W_DNA(0.60) × dna_cosine + _W_INTENT(0.28) × intent_jacc + _W_QUALITY(0.12) × quality
      + axis_bonus (up to +0.15)
-     + archetype_bonus
 
 # Session intent conflict override (2026-05-24):
 # When the hotel's dominant chromosome matches the user's session intent AND
@@ -58,7 +60,7 @@ The shortlist **response body** now carries a top-level `scored_intents: list[st
 `_calculate_match_score` returns a 6-tuple — the 6th element is a `_trace` dict exposing the intermediate components:
 ```python
 _trace = { "dna_cos": float, "taste": float, "tier": float, "pen": float,
-           "qual": float, "ax": float, "arch": float, "no_codons": bool }
+           "qual": float, "ax": float, "no_codons": bool }
 ```
 This is used by the per-hotel CloudWatch log `hotel_scored` (see Observability section) and is NOT added to the API response body.
 
@@ -85,7 +87,7 @@ _W_QUALITY = 0.12
 
 # Base score
 raw = _W_DNA * dna_cosine + _W_INTENT * intent_jacc + _W_QUALITY * quality
-    + axis_bonus + archetype_bonus
+    + axis_bonus
 
 # Amenity boost (post-base, capped to preserve proportionality)
 _am_boost = min(_am_matches * _cfg_magic("amenity_match_boost", 0.03), 0.20)
@@ -115,6 +117,40 @@ Per-search events emitted by `mywai-sherpa/cognitive/sketch_engine.py`:
 |-------|------|------------|
 | `intent_codons_raw` | before enrichment | `codons` (LLM-extracted), `user_message[:120]` |
 | `search_dispatch` | before calling shortlist | `routing_codons`, `dna_top5`, `pool`, `query[:80]` |
+
+## Intent provenance — which ask reached THIS hotel (2026-09-24)
+
+**Read by no ranking term.** It is an evidence channel for the card's because-clause, added because no
+hotel card could ever say the traveller's request was why a hotel ranked (ticket 196).
+
+- `affinity_graph.expand()` returns `list[IntentEdge]` — `{source, target, weight, graph}`. It used to
+  return `{target: weight}`, which collapsed two sources onto one target and destroyed *which* input
+  caused the hit (52 live edges → 47 targets). The flat return is DELETED, no shim.
+- `fold_weights(edges)` rebuilds the weight map and MUST be called **per graph**: the clamp in `expand()`
+  is per-edge against a running sum, so folding one combined list yields different weights than the
+  graphs produced separately. It raises `ValueError` on a mixed list rather than drift quietly.
+- `attach_intent_provenance(item, edges, hotel_codons)` runs at `handler.py:2510`, **after** every score
+  mutation and before both sorts, which read only `final_score` / `match_01`. It writes
+  `item["intent_provenance"]` = the edges whose `target` is in that hotel's own codons, capped at 8.
+- **The key is ABSENT when nothing intersects** — a turn with no stated ask serialises exactly as before.
+- **Ordering: positives first**, then by descending magnitude, with `(source, target)` as the tiebreak.
+  32 of 132 live edges are negative; ordering by magnitude alone let "avoid" edges fill all 8 slots and
+  push the real positive support out.
+- A malformed codon list degrades to no key plus one WARNING — never an exception. The call sits in an
+  un-wrapped per-hotel loop, so a raise here would 500 the whole deck for a caption.
+
+**Proof the shape change cost no ranking** (24 Sep 2026): old tree vs new, same body, real Aurora, same
+minute — all 50 `hotel_scored` lines identical and in the same order, every payload identical apart from
+the new key. Re-verify with `tests/test_affinity_graph_edges.py` (exact `==` against a frozen copy of the
+old `expand`, real 274-codon prod index map).
+
+### Rules for anything that RENDERS this
+- **Voice the `source`, never the `target`.** The target is our inference. Voicing it produces
+  "you asked for design-led boutiques" on a turn where they typed "a romantic hotel" — a fabricated quote.
+- **A negative weight may NEVER be voiced as "because you asked for…".**
+- **A `source` is not necessarily something they said.** `handler.py:1660` folds
+  `intent_codons + implied_intent_codons`, so a source can be DNA-derived. The traveller's verbatim words
+  are joined SHERPA-side; no raw traveller text travels down to DNA.
 
 ## Gotchas
 - Amenity boost is additive post-base — a 5-pill search with 5/5 matches adds 0.15 (15 pts). A 2-pill search with 2/2 matches adds 0.06 (6 pts). The cap at 20 pts prevents large pill selections from overwhelming the DNA alignment signal
