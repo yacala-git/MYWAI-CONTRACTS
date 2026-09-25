@@ -217,6 +217,62 @@ so without the party fact a seeded tile would delete the family/business fact fl
   DNA-bound request when `DEST#BEAC` is in the turn's WINNING session codons (tile, typed, or carried);
   key absent otherwise. `DEST#COAS` alone never sets it. DNA side: `contracts/dna_hotel_search.md`.
 
+**Cancelling a seeded codon — "the newest thing you said wins" (ticket 203, 25 Sep 2026):**
+
+The trip's stated intent is a CURRENT STATE, not an accumulation. A later sentence CANCELS codons an
+earlier tile or sentence added; the owner's ruling is *"it should override"*.
+
+- **The cancel is a DROP, never a negative weight.** `build_codon_vector` (`mywai-dna`
+  `pg_client.py:4634-4694`) treats an absent codon and a zero-weight codon identically, so removing
+  the id returns that axis to exactly NEUTRAL. A negative weight would be an *avoid/dislike*
+  feature, which is deliberately NOT built. Evidence: `.study/known-city-moods-2026-09-23/cancel-mechanism.md`.
+- **Path:** `extract_edit_ir` (cue-gated Haiku) → `FollowupEditIR.mood_drops` (a `MoodFamily` enum)
+  → `handler._MOOD_FAMILY_CODONS` expands the family to codon ids → `handler._edit_clears_from_ir`
+  → BOTH `constraint_state.apply_clears` (a per-VALUE drop inside the `session_intent_codons` cell,
+  the rest of the cell kept) and the committed fast-path's `_restored_si` filter (the legacy slot).
+- **Read at PLAN time, not snapshotted.** The day-plan compose reads the live
+  `state.session_intent_codons` cell, so a cancellation typed at the HOTEL step still holds when the
+  days are composed later (the `02db66e` stale-snapshot trap).
+- **`explicit=True` is what makes it survive.** The legacy `state._seed` bridge skips an explicit
+  cell, so a dropped codon cannot be re-introduced from `slots` next turn. A drop that empties the
+  cell collapses it to `None`; the activity retrieval then falls back to the saved DNA profile.
+
+| `MoodFamily` | Traveller says | Codons dropped |
+|---|---|---|
+| `romance` | "not romantic anymore" | MOOD#ROMN · SOC#COUP |
+| `work` | "no longer for work" | PURP#WORK |
+| `family` | "not a family trip anymore" | FAMI#KIDS · SOC#GRUP · SOC#FAM |
+| `sightseeing` | "no sightseeing", "skip the tours" | ACTV#SGHT *(Landmark admission)* · ACTV#TOUR *(Guided city tour)* · CULT#GUID *(Expert-guided heritage tour)* |
+| `museums` | "no museums", "no galleries" | CULT#MUSE *(Museum & gallery visit)* · CULT#ARTG *(Art & museums)* |
+
+- **Rule for a new family — LOOK EVERY ID UP BY MEANING, never by how the id reads.** Source:
+  `mywai-dna/lambda/dna-api/codon_tags.json` + `mywai-dna/docs/activity_codons_draft.md`. Two ids
+  failed exactly this way in code review (25 Sep 2026) and are now permanently EXCLUDED:
+  - `ACTV#WALK` reads like "walking tour" but means **"Hiking & walking"**, and `child_interests.py`
+    maps it to the *outdoors* child interest — cancelling it on "no sightseeing" would delete a
+    traveller's hiking signal and a child's declared interest. The real walking-tour id is `ACTV#TOUR`.
+  - `CULT#ARCH` ("Architecture & design") is **also the `romantic` tile's codon**, so dropping it
+    would weaken a romance signal the traveller never withdrew — the cross-family bleed this rule
+    exists to forbid.
+- **Rule, restated:** name only the codons for THE DOING of the cancelled thing. Never a `DEST#*`
+  place attribute (`DEST#HIST` is deliberately absent from `sightseeing`: "no sightseeing" does not
+  stop Rome being a historic city, and `DEST#*` is also read by the destination deck). Never a codon
+  another tile mood seeds. Never another family's mood-gate codon. Cancelling one thing must not
+  wipe the rest of the trip. Both rules are enforced over the WHOLE table by
+  `tests/cognitive/test_edit_resolver.py` (`test_no_drop_family_names_a_dest_place_attribute`,
+  `test_no_drop_family_shares_a_codon_with_another_tile_mood`,
+  `test_a_sightseeing_drop_must_not_cancel_hiking_or_romance`).
+- **BOTH removal lists (`clears` AND `mood_drops`) now share ONE fail-safe before-validator**
+  (`FollowupEditIR._filter_enum_list`): an off-enum entry is dropped, never raised, so a near miss
+  costs that one entry instead of the whole IR and its co-emitted budget / amenity / pax / flight
+  edits. MEASURED before the fix: `{"clears":["bogus"],"budget":{"amount":900}}` raised a
+  `ValidationError` and lost the budget. One implementation so the two cannot drift — the widened
+  removal wording makes a `clears`/`mood_drops` mix-up MORE likely, not less. Guards in
+  `tests/cognitive/test_edit_resolver.py`.
+- **Not built:** the positive counterpart. "no museums, we only want food and markets" cancels the
+  museums but does NOT add `FOOD#MARK` — the edit IR has no field for ADDING session codons on the
+  committed fast-path.
+
 **Flight delta fast-path (2026-06-19):**
 Once a destination is committed, `_apply_flight_delta` is called on every turn to detect cabin/direct/origin/dest changes without an LLM call. It receives `trip_shape` and `hotel_locked` context:
 - `trip_shape == "hotel_only"` → returns immediately (no flights on this trip)
