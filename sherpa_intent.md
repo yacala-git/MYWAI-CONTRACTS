@@ -49,6 +49,7 @@ Originally shipped flag-gated (`lambda/shared/enrich_flags.py`, SSM prefix `/myw
 6. Sketch engine uses `session_intent_codons_override` (from Sonnet) for session tier; `implied_intent_codons` from enrichment soft_entries
 7. `session_intent_codons` bypasses `rebase_intent_codons` — only soft implied codons are rebased
 8. Enriched FAISS query + both codon lists forwarded to DNA shortlist
+9. **Mood VETOES (ticket 206, 25 Sep 2026)** — a drop is a PERSISTENT VETO, not a deletion. `FollowupEditIR.mood_drops` (model-emitted; **never a regex** on the traveller's words) is expanded by `handler._edit_clears_from_ir` through `_MOOD_FAMILY_CODONS` and recorded by `constraint_state.apply_mood_vetoes` in the new `ConstraintState.mood_vetoes` cell. Every query build then asks the ONE computation, `constraint_state.effective_session_codons` → **(base ∪ adds) − vetoes**. This is what closes ticket 205: `_explicit_hotel_slots` may keep rebuilding an UN-dropped `user_constraints["session_intent_codons"]` copy (and the trip slot may keep persisting it) because the subtraction happens LAST, at the query-build seam (`handler._veto_filter_user_constraints`, immediately after the `_explicit_hotel_slots` merge), plus the discover arbitration output and the `/build/plan-edit` compose reader. Order of writes stops mattering; no add path can resurrect a cancelled codon. `apply_clears`'s per-value removal is kept as an eager, idempotent pre-application of the same subtraction — the two cannot disagree. **The exit:** a veto is lifted ONLY by an add that NAMES that family in a later turn (`handler._edit_mood_lifts_from_ir` → `apply_mood_vetoes(lift=…)`); incidental arrival via another family's expansion or a default never lifts. Within one turn the drop wins. The lift is LIVE since step 2 (`FollowupEditIR.mood_adds`); step 2 also adds `constraint_state.apply_adds` (the union writer) and the `adds=` term at the seam, so a positive reaches the SAME computation rather than going round it — see "The positive half" below. `mood_vetoes` is not projected, not clearable, has no legacy slot home, and survives a partitioned RESET (like `session_intent_codons` itself).
 
 ## Durable-taste extraction (2026-07-03, write-side)
 `produce_intent` emits `durable_taste_phrases: list[str]` — LASTING personal tastes stated with a genuine preference VERB (love/hate/prefer/…), in the user's own words, any language. A trip REQUEST ("I want a 5-star hotel in Paris", "I need…", "looking for…") returns `[]`. Pydantic validator `IntentPayload._clean_taste_phrases` is fail-safe (non-list/dirty → [], ≤120 chars/phrase, ≤6 phrases). Handler sets `explicit_hotel_slots["durable_taste_phrases"]` UNCONDITIONALLY when produce_intent ran (even []) so the passive-DNA fire site distinguishes "Sonnet ran → fire per phrase" from "fast-path → regex fallback". NOT persisted to `trip_slot`. Each phrase fires ONE `chat.strong` DNA signal with `event_id=turn_id#i`. See `sherpa_dna.md` → "Durable-taste signal gate".
@@ -269,9 +270,52 @@ earlier tile or sentence added; the owner's ruling is *"it should override"*.
   `ValidationError` and lost the budget. One implementation so the two cannot drift — the widened
   removal wording makes a `clears`/`mood_drops` mix-up MORE likely, not less. Guards in
   `tests/cognitive/test_edit_resolver.py`.
-- **Not built:** the positive counterpart. "no museums, we only want food and markets" cancels the
-  museums but does NOT add `FOOD#MARK` — the edit IR has no field for ADDING session codons on the
-  committed fast-path.
+**The positive half — a later sentence also ADDS (ticket 206 step 2, 25 Sep 2026):**
+
+`FollowupEditIR.mood_adds` is the mirror of `mood_drops`: the SAME `MoodFamily` enum, the SAME
+`handler._MOOD_FAMILY_CODONS` table, the SAME shared fail-safe validator. One vocabulary on purpose —
+a veto is lifted only by an add that NAMES that family, so the two sides must speak the same words or
+the exit could never reach the veto.
+
+- **Why the IR is the only channel.** On a COMMITTED trip a follow-up skips Sonnet extraction
+  entirely, which is the whole reason the cue-gated edit IR exists. The IR already had positive
+  channels (climate / amenities / pax / cabin / dest_switch) but none that wrote
+  `session_intent_codons`, so *"we only want food and markets"* added nothing. A first/discover turn
+  was never affected.
+- **Path:** `extract_edit_ir` → `FollowupEditIR.mood_adds` → `handler._edit_mood_adds_from_ir`
+  (the ONE expansion; `_edit_mood_lifts_from_ir` is a wrapper on it) → BOTH
+  `constraint_state.apply_adds` (a UNION into the cell, never a replace — every other write of that
+  cell goes through `_set_cell`, which REPLACES) and the `adds=` term at the query-build seam
+  (`handler._veto_filter_user_constraints`), so the add reaches THIS turn's query and not only the
+  next one.
+- **The add flows THROUGH the subtraction, never around it.** Order inside a turn:
+  `apply_clears` → `apply_adds` → `apply_mood_vetoes`. The veto's enforcement arm re-derives the cell
+  as `(cell − vetoes)` after the union, which is what makes *remove-wins* hold inside one sentence and
+  what stops a broad add resurrecting a cancelled codon.
+- **New family row.** `food_markets` → `FOOD#MARK` *(Local food markets)* · `FOOD#LOCAL`
+  *(Local cuisine)* · `FOOD#STRF` *(Street food)*. Deliberately NOT `FOOD#TOUR` (*"Food tour"* — a
+  GUIDED tour, and the same sentence cancelled guided tours), NOT `FOOD#COOK` (a class nobody asked
+  for), NOT `FOOD#FINE`/`FOOD#GAST` (a price claim they did not make, and the `romantic`/`foodie`
+  tile's codon), NOT `FOOD#CAFE`/`FOOD#WINE`/`FOOD#BEER`/`FOOD#SEAF` (other tiles' codons). The
+  cross-family rule now binds in BOTH directions: a loose row over-cancels AND over-promises.
+- **REMOVE WINS** on a same-turn, same-family conflict — the opposite of this model's SET-beats-CLEAR
+  rule for budget/climate, on the owner's asymmetry argument: a wrongly dropped request is a gap the
+  traveller can fix by asking again; a wrongly restored rejection is the product ignoring them.
+  `FollowupEditIR._coerce` deliberately does NOT strip the co-emitted drop; the conflict is resolved
+  by `apply_mood_vetoes` (`lift - drop`) and LOGGED by `handler._log_mood_family_collision`
+  (`mood_family_collision`, deduped per turn). Item-level exceptions (*"no museums but the Vatican"*)
+  are OUT OF SCOPE by the owner's ruling until that log says whether travellers say it — the edit
+  reader has no named-entity channel.
+- **The empty-cell gate is FIXED.** `_edit_clears_from_ir`'s mood arm is no longer `active`-gated: a
+  drop uttered while the session cell is EMPTY used to record no veto at all, so *"no museums, add
+  nightlife"* would have kept the ADD and lost the VETO. A veto needs no existing value to be
+  meaningful; every other clearable field keeps the gate (it exists so a clear is never fabricated for
+  a never-set cell).
+- **No regex anywhere on the add or the veto path** (owner's constraint) — both come from the model's
+  structured output. Pinned by `tests/baselines/test_mood_veto.py::test_no_veto_path_reads_the_message`.
+- **Acceptance, all pinned as tests** (`tests/baselines/test_mood_veto.py`, step-2 section): markets
+  present + sightseeing absent; same-sentence conflict → the drop holds; a later broad add does not
+  resurrect; a named add brings the family back; an add does not clobber existing codons.
 
 **Flight delta fast-path (2026-06-19):**
 Once a destination is committed, `_apply_flight_delta` is called on every turn to detect cabin/direct/origin/dest changes without an LLM call. It receives `trip_shape` and `hotel_locked` context:
